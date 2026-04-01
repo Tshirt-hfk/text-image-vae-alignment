@@ -1,12 +1,15 @@
 """
-Alignment Loss: Maximize probability of image latent under text Gaussian distribution.
+Alignment Loss: Image Gaussian and Text Gaussian.
 
-Core idea (from discussion):
-  - Image encoded as a POINT in latent space
-  - Text encoded as a GAUSSIAN DISTRIBUTION N(μ_text, σ²_text·I)
-  - Training objective: maximize p(z_img | text) = N(z_img; μ_text, σ²_text·I)
-  
-Equivalently minimize: -log N(z_img; μ_text, σ²_text·I)
+Core idea (master's latest revision):
+    Image encoded as Gaussian: N(μ_img, σ²_img·I)
+    Text  encoded as Gaussian: N(μ_text, σ²_text·I)
+    
+    Maximize p(image_gaussian | text_gaussian)
+    ⟺ Minimize KL(N(μ_img, σ²_img) || N(μ_text, σ²_text))
+
+KL(N(μ1, σ1²) || N(μ2, σ2²)) closed form:
+    = Σ_d [ log(σ2_d/σ1_d) + (σ1_d² + (μ1_d-μ2_d)²) / (2σ2_d²) - 0.5 ]
 """
 
 import torch
@@ -16,92 +19,108 @@ import torch.nn.functional as F
 
 class GaussianAlignmentLoss(nn.Module):
     """
-    Loss that encourages the image latent point to have high probability
-    density under the text-encoded Gaussian distribution.
+    KL divergence between image Gaussian and text Gaussian distributions.
     
-    L_alignment = -log p(z_img | text)
-                   = Σ [(z_img_i - μ_i)² / (2σ_i²)] + Σ log(σ_i) + const
+    L = KL(N_img || N_text) = E_{z~N_img}[log N_img(z) - log N_text(z)]
+                            = KL closed form above
     
-    This is essentially a weighted MSE, where the weighting is inversely
-    proportional to σ² (dimensions with smaller σ get more emphasis).
+    Minimizing this pushes the image distribution toward the text distribution:
+    - μ_img → μ_text (means align)
+    - σ_img → σ_text (variances match)
     
-    Additionally, we can combine with:
-    - VAE KL loss: KL(q(z|x) || N(0,I)) to regularize latent space
-    - Bidirectional alignment: also push text samples toward image latents
+    This is equivalent to maximizing the probability of the image Gaussian
+    being consistent with the text-encoded semantic region.
     """
     
-    def __init__(self, temperature=1.0, bidirectional=False):
+    def __init__(self, bidirectional=False, temperature=1.0):
         """
         Args:
-            temperature: Scale factor for the Mahalanobis distance.
-                        Higher T → softer alignment (less penalty for远离μ)
-            bidirectional: If True, also compute text→image alignment (symmetric)
+            bidirectional: If True, also compute KL(text||image) and average.
+                          This enforces I ⟂ T (mutual subspace membership).
         """
         super().__init__()
-        self.temperature = temperature
         self.bidirectional = bidirectional
+        self.temperature = temperature
+    
+    def kl_gaussian(self, mu1, logsigma1, mu2, logsigma2):
+        """
+        KL(N(μ1, σ1²) || N(μ2, σ2²)) for diagonal Gaussians.
         
-    def forward(self, z_img, mu_text, logsigma_text, z_img_from_text=None, mu_img=None, logsigma_img=None):
+        Args:
+            mu1, logsigma1: [B, D] first distribution (image)
+            mu2, logsigma2: [B, D] second distribution (text)
+        
+        Returns:
+            kl: scalar KL divergence
+        """
+        sigma1 = torch.exp(torch.clamp(logsigma1, min=-5, max=5))
+        sigma2 = torch.exp(torch.clamp(logsigma2, min=-5, max=5))
+        
+        # log(σ2/σ1) per dimension
+        log_ratio = logsigma2 - logsigma1
+        
+        # (σ1² + (μ1-μ2)²) / (2σ2²) per dimension
+        var_term = (sigma1 ** 2 + (mu1 - mu2) ** 2) / (2 * sigma2 ** 2 + 1e-8)
+        
+        # Full KL per dimension
+        kl_per_dim = log_ratio + var_term - 0.5
+        
+        return kl_per_dim.sum(dim=-1).mean()  # sum over dims, mean over batch
+    
+    def forward(self, mu_img, logsigma_img, mu_text, logsigma_text):
         """
         Args:
-            z_img: [B, D] image latent point from VAE encoder
-            mu_text: [B, D] text Gaussian mean
-            logsigma_text: [B, D] text Gaussian log standard deviation
-        
-        Optional (if bidirectional=True):
-            z_img_from_text: [B, D] sampled from text Gaussian
-            mu_img: [B, D] image Gaussian mean (from img encoder)
-            logsigma_img: [B, D] image Gaussian log std (from img encoder)
+            mu_img:      [B, D] image Gaussian mean
+            logsigma_img:[B, D] image Gaussian log standard deviation
+            mu_text:     [B, D] text Gaussian mean
+            logsigma_text:[B, D] text Gaussian log standard deviation
         
         Returns:
             loss: scalar alignment loss
-            metrics: dict of per-component losses for logging
+            metrics: dict
         """
-        sigma_text = torch.exp(logsigma_text)
-        D = z_img.shape[-1]
+        T = self.temperature
         
-        # === Forward alignment: Image → Text Gaussian ===
-        # log p(z_img | text) = -0.5 * Σ [(z_i - μ_i)² / σ_i²] - Σ log(σ_i) + C
-        diff = z_img - mu_text
-        
-        # Weighted MSE (inverse variance weighting)
-        weighted_mse = torch.sum(diff ** 2 / (2 * sigma_text ** 2 * self.temperature + 1e-8), dim=-1)
-        log_det = torch.sum(logsigma_text, dim=-1)
-        
-        log_prob = -(weighted_mse + log_det)
-        L_alignment = -log_prob.mean()
+        # Forward KL: image → text (what we want to minimize)
+        kl_forward = self.kl_gaussian(
+            mu_img / T, logsigma_img / T,
+            mu_text / T, logsigma_text / T
+        )
         
         metrics = {
-            "loss_alignment_forward": L_alignment.item(),
-            "mean_mahalanobis_dist": weighted_mse.mean().item(),
-            "mean_logsigma": logsigma_text.mean().item(),
+            "kl_forward": kl_forward.item(),
+            "mu_img_norm": mu_img.norm(dim=-1).mean().item(),
+            "mu_text_norm": mu_text.norm(dim=-1).mean().item(),
+            "sigma_img_mean": torch.exp(logsigma_img).mean().item(),
+            "sigma_text_mean": torch.exp(logsigma_text).mean().item(),
         }
         
-        # === Bidirectional: also align text to image ===
-        if self.bidirectional and z_img_from_text is not None and mu_img is not None:
-            sigma_img = torch.exp(logsigma_img)
-            
-            # Text sample should have high prob under image Gaussian
-            diff_rev = z_img_from_text - mu_img
-            weighted_mse_rev = torch.sum(diff_rev ** 2 / (2 * sigma_img ** 2 * self.temperature + 1e-8), dim=-1)
-            log_det_rev = torch.sum(logsigma_img, dim=-1)
-            log_prob_rev = -(weighted_mse_rev + log_det_rev)
-            
-            L_alignment_rev = -log_prob_rev.mean()
-            L_alignment = (L_alignment + L_alignment_rev) * 0.5
-            
-            metrics["loss_alignment_reverse"] = L_alignment_rev.item()
+        if self.bidirectional:
+            kl_reverse = self.kl_gaussian(
+                mu_text / T, logsigma_text / T,
+                mu_img / T, logsigma_img / T
+            )
+            loss = (kl_forward + kl_reverse) * 0.5
+            metrics["kl_reverse"] = kl_reverse.item()
+        else:
+            loss = kl_forward
         
-        return L_alignment, metrics
+        return loss, metrics
 
 
 class TotalLoss(nn.Module):
     """
-    Combined loss for Alignment VAE training.
+    Combined loss for Alignment VAE.
     
     L_total = λ_recon · MSE(x, x̂)
-            + λ_kl · KL(q(z|x) || N(0, I))
-            + λ_align · L_alignment(z_img, μ_text, σ_text)
+            + λ_kl_vae · KL(q(z|x) || N(0,I))
+            + λ_align · KL(N_img || N_text)
+    
+    Args:
+        weight_recon: weight for reconstruction loss
+        weight_kl: weight for VAE KL prior regularization
+        weight_alignment: weight for alignment KL
+        bidirectional: whether to use symmetric alignment
     """
     
     def __init__(
@@ -109,66 +128,59 @@ class TotalLoss(nn.Module):
         weight_recon=1.0,
         weight_kl=1e-6,
         weight_alignment=0.1,
-        temperature=1.0,
         bidirectional=False,
+        temperature=1.0,
     ):
         super().__init__()
         self.weight_recon = weight_recon
         self.weight_kl = weight_kl
         self.weight_alignment = weight_alignment
         
-        self.alignment_loss = GaussianAlignmentLoss(
-            temperature=temperature,
+        self.align_loss = GaussianAlignmentLoss(
             bidirectional=bidirectional,
+            temperature=temperature,
         )
-        
-    def forward(self, x, x_recon, z_img, mu_text, logsigma_text, 
-                z_img_prior=None, kl_weight=None):
+    
+    def forward(self, x, x_recon, mu_img, logsigma_img, mu_text, logsigma_text, kl_vae=None):
         """
         Args:
-            x: [B, C, H, W] original images
-            x_recon: [B, C, H, W] reconstructed images
-            z_img: [B, D] image latent from VAE encoder
-            mu_text: [B, D] text Gaussian mean
-            logsigma_text: [B, D] text Gaussian log std
-            z_img_prior: optional, for KL against standard Gaussian
+            x:           [B, C, H, W] original images
+            x_recon:     [B, C, H, W] reconstructed images
+            mu_img:      [B, D] image Gaussian mean
+            logsigma_img:[B, D] image Gaussian log std
+            mu_text:     [B, D] text Gaussian mean
+            logsigma_text:[B, D] text Gaussian log std
+            kl_vae:      optional precomputed VAE KL (from encoder)
         
         Returns:
-            loss: total loss
+            loss:   total combined loss
             metrics: dict of per-component losses
         """
-        # Reconstruction loss (pixel-space MSE)
+        # Reconstruction
         L_recon = F.mse_loss(x_recon, x)
         
-        # KL divergence against standard Gaussian N(0, I)
-        # KL(q(z|x) || N(0,I)) ≈ -0.5 * Σ [1 + log(σ²) - μ² - σ²]
-        if z_img_prior is not None:
-            # z_img already encodes mean and variance info
-            # Simple KL: we don't have explicit μ_kl, σ_kl from encoder
-            # So we use a simplified approach: just regularize z_img toward N(0,I)
-            # This is weaker than true VAE KL but sufficient for our setup
-            L_kl = torch.mean(z_img ** 2) * 0.5  # ⟂ Encourage z near origin
+        # VAE KL prior regularization
+        if kl_vae is not None:
+            L_kl_vae = kl_vae
         else:
-            L_kl = torch.tensor(0.0, device=x.device)
+            L_kl_vae = -0.5 * torch.mean(1 + logsigma_img - mu_img.pow(2) - logsigma_img.exp())
         
-        # Alignment loss: maximize p(z_img | text)
-        L_alignment, align_metrics = self.alignment_loss(
-            z_img, mu_text, logsigma_text
-        )
+        # Alignment KL: image Gaussian → text Gaussian
+        L_align, align_metrics = self.align_loss(mu_img, logsigma_img, mu_text, logsigma_text)
         
         # Combine
-        L_total = (
+        loss = (
             self.weight_recon * L_recon
-            + self.weight_kl * L_kl
-            + self.weight_alignment * L_alignment
+            + self.weight_kl * L_kl_vae
+            + self.weight_alignment * L_align
         )
         
         metrics = {
-            "loss_total": L_total.item(),
+            "loss_total": loss.item(),
             "loss_recon": L_recon.item(),
-            "loss_kl": L_kl.item(),
-            "loss_alignment": L_alignment.item(),
+            "loss_kl_vae": L_kl_vae.item(),
+            "loss_alignment": L_align.item(),
             **{f"align_{k}": v for k, v in align_metrics.items()},
         }
         
-        return L_total, metrics
+        return loss, metrics

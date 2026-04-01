@@ -1,6 +1,9 @@
 """
 Training script for AlignmentVAE.
 
+Both image and text are encoded as Gaussian distributions.
+Loss = MSE reconstruction + VAE KL + Alignment KL(image || text)
+
 Usage:
     python train.py --config configs/default.yaml
 """
@@ -16,7 +19,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import open_clip
 
 from model import AlignmentVAE, build_text_encoder
 from losses import TotalLoss
@@ -24,8 +26,8 @@ from losses import TotalLoss
 
 class ImageCaptionDataset(Dataset):
     """
-    Dataset that returns (image, caption) pairs.
-    Supports COCO, LAION, or dummy data for testing.
+    Dataset returning (image, caption) pairs.
+    Falls back to dummy data if no real data available.
     """
     
     def __init__(self, root, caption_file, transform=None, max_samples=None):
@@ -35,27 +37,29 @@ class ImageCaptionDataset(Dataset):
             transforms.ToTensor(),
         ])
         
-        # Load captions
         if caption_file and os.path.exists(caption_file):
             import pandas as pd
             df = pd.read_csv(caption_file)
             self.captions = df['caption'].tolist()
             self.image_paths = df['image_path'].tolist()
         else:
-            # Dummy data for testing
+            # Dummy captions for testing
             self.captions = [
                 "a cat sitting on a couch",
                 "a dog running in the park",
                 "a red bicycle next to a tree",
                 "a person riding a skateboard",
                 "a bowl of fruit on a table",
-            ] * 20
+                "a sunset over the ocean",
+                "a city skyline at night",
+                "a bird flying in the sky",
+            ] * 25
             self.image_paths = [None] * len(self.captions)
         
         if max_samples:
             self.captions = self.captions[:max_samples]
             self.image_paths = self.image_paths[:max_samples]
-        
+    
     def __len__(self):
         return len(self.captions)
     
@@ -69,54 +73,34 @@ class ImageCaptionDataset(Dataset):
                 img = Image.open(img_path).convert("RGB")
                 if self.transform:
                     img = self.transform(img)
-            except Exception as e:
-                # Fallback: create dummy image
+            except Exception:
                 img = torch.rand(3, 256, 256)
         else:
-            # Dummy image for testing
             img = torch.rand(3, 256, 256)
         
         return img, caption
 
 
-class DummyTextEncoder:
-    """
-    Dummy text encoder for testing without CLIP.
-    Maps text to a random embedding, but the Gaussian heads still work.
-    """
-    def __init__(self, embed_dim=768):
-        self.embed_dim = embed_dim
-        self.text_projection = torch.eye(embed_dim)  # dummy
-    
-    def __call__(self, text, device):
-        if isinstance(text, str):
-            text = [text]
-        B = len(text)
-        return torch.randn(B, self.embed_dim, device=device)
-    
-    def to(self, device):
-        return self
-
-
 def build_model(cfg, device):
-    """Build AlignmentVAE model with text encoder."""
+    """Build AlignmentVAE with Gaussian text encoder."""
     
-    # === Build text encoder (CLIP-based Gaussian encoder) ===
+    vae_cfg = cfg.get('model', {})
+    latent_dim = vae_cfg.get('latent_dim', 768)
+    
+    # === Text encoder (CLIP + Gaussian heads) ===
+    text_gaussian = None
     try:
-        # Try to load real CLIP
         text_enc, clip_base, preprocess = build_text_encoder(
             model_name=cfg.get('text_encoder_model', 'ViT-L/14'),
             pretrained=cfg.get('text_encoder_pretrained', 'openai'),
             device=device,
             freeze=cfg.get('freeze_text_encoder', True),
         )
-        print(f"[OK] Loaded CLIP text encoder: {cfg.get('text_encoder_model', 'ViT-L/14')}")
         
-        # For the GaussianTextEncoder wrapper, we need a callable that takes text
+        # Wrap CLIP for use with GaussianTextEncoder
         class CLIPWrapper:
-            def __init__(self, clip_model, preprocess):
+            def __init__(self, clip_model, device):
                 self.clip_model = clip_model
-                self.preprocess = preprocess
                 self.text_projection = clip_model.model.text_projection
                 self._device = device
             
@@ -136,34 +120,52 @@ def build_model(cfg, device):
                 self.clip_model.model = self.clip_model.model.to(d)
                 return self
         
-        clip_wrapper = CLIPWrapper(clip_base, preprocess)
+        clip_wrapper = CLIPWrapper(clip_base, device)
         
         from model.text_encoder import GaussianTextEncoder
-        latent_dim = cfg.get('latent_dim', 768)
         text_gaussian = GaussianTextEncoder(
             text_encoder=clip_wrapper,
             latent_dim=latent_dim,
-            hidden_dim=cfg.get('text_gaussian_hidden', latent_dim),
-            freeze_base=cfg.get('freeze_text_encoder', True),
+            hidden_dim=vae_cfg.get('text_gaussian_hidden', latent_dim),
+            freeze_base=vae_cfg.get('freeze_text_encoder', True),
         )
-        print("[OK] Gaussian text encoder ready")
+        print(f"[OK] CLIP text encoder loaded: {cfg.get('text_encoder_model', 'ViT-L/14')}")
         
     except Exception as e:
-        print(f"[WARN] Could not load CLIP ({e}), using dummy text encoder")
-        text_gaussian = None
+        print(f"[WARN] Could not load CLIP: {e}")
+        print("[WARN] Using random text embeddings (no semantic alignment)")
+        # Dummy text encoder: random embeddings
+        class DummyTextGaussian(nn.Module):
+            def __init__(self, dim):
+                super().__init__()
+                self.dim = dim
+                self.net = nn.Sequential(nn.Linear(dim, dim), nn.GELU())
+                self.mu_head = nn.Linear(dim, dim)
+                self.logsigma_head = nn.Linear(dim, dim)
+                nn.init.zeros_(self.logsigma_head.weight)
+                nn.init.constant_(self.logsigma_head.bias, -2.0)
+            
+            def forward(self, text):
+                B = len(text) if isinstance(text, list) else 1
+                h = torch.randn(B, self.dim)
+                h = self.net(h)
+                mu = self.mu_head(h)
+                logsigma = torch.clamp(self.logsigma_head(h), min=-5, max=2)
+                return mu, logsigma
+        
+        text_gaussian = DummyTextGaussian(latent_dim)
     
-    # === Build AlignmentVAE ===
-    vae_cfg = cfg.get('model', {})
+    # === AlignmentVAE ===
     model = AlignmentVAE(
-        latent_dim=vae_cfg.get('latent_dim', 768),
+        latent_dim=latent_dim,
         image_channels=vae_cfg.get('image_channels', 3),
         hidden_dims=vae_cfg.get('hidden_dims', [128, 256, 512, 512]),
         text_encoder=text_gaussian,
         freeze_text_encoder=vae_cfg.get('freeze_text_encoder', True),
-        text_gaussian_hidden_dim=vae_cfg.get('text_gaussian_hidden', 768),
+        text_gaussian_hidden_dim=vae_cfg.get('text_gaussian_hidden', latent_dim),
     )
     
-    return model, text_gaussian
+    return model
 
 
 def train(cfg):
@@ -173,7 +175,7 @@ def train(cfg):
     print(f"Training on: {device}")
     
     # === Model ===
-    model, text_encoder = build_model(cfg, device)
+    model = build_model(cfg, device)
     model = model.to(device)
     
     # === Optimizer ===
@@ -181,18 +183,14 @@ def train(cfg):
     lr = train_cfg.get('lr', 1e-4)
     lr_text_adapter = train_cfg.get('lr_text_adapter', 5e-5)
     
-    # Different LR for text Gaussian heads vs rest
     vae_params = list(model.vae.parameters())
-    text_adapter_params = list(text_encoder.net.parameters()) + \
-                          list(text_encoder.mu_head.parameters()) + \
-                          list(text_encoder.logsigma_head.parameters()) if text_encoder else []
+    text_params = list(model.text_encoder.parameters())
     
     optimizer = optim.AdamW([
         {'params': vae_params, 'lr': lr},
-        {'params': text_adapter_params, 'lr': lr_text_adapter},
+        {'params': text_params, 'lr': lr_text_adapter},
     ], weight_decay=train_cfg.get('weight_decay', 0.01))
     
-    # === Scheduler ===
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=train_cfg.get('epochs', 100)
     )
@@ -202,11 +200,11 @@ def train(cfg):
         weight_recon=train_cfg.get('weight_recon', 1.0),
         weight_kl=train_cfg.get('weight_kl', 1e-6),
         weight_alignment=train_cfg.get('weight_alignment', 0.1),
+        bidirectional=False,
         temperature=train_cfg.get('alignment_temp', 1.0),
     ).to(device)
     
     # === Dataset ===
-    dataset_cfg = cfg.get('dataset', {})
     dataset = ImageCaptionDataset(
         root=train_cfg.get('data_root', './data'),
         caption_file=train_cfg.get('caption_file', './data/captions.csv'),
@@ -229,9 +227,8 @@ def train(cfg):
     
     for epoch in range(epochs):
         model.train()
-        epoch_losses = {k: 0.0 for k in [
-            'loss_total', 'loss_recon', 'loss_kl', 'loss_alignment'
-        ]}
+        epoch_losses = {k: 0.0 for k in ['loss_total', 'loss_recon', 'loss_kl_vae', 'loss_alignment']}
+        n_batches = 0
         
         for batch_idx, (images, captions) in enumerate(dataloader):
             images = images.to(device)
@@ -243,31 +240,29 @@ def train(cfg):
             optimizer.zero_grad()
             loss.backward()
             
-            # Gradient clipping
             if grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             
             optimizer.step()
             
-            # Accumulate losses
+            # Accumulate
             for k in epoch_losses:
                 if k in metrics:
                     epoch_losses[k] += metrics[k]
+            n_batches += 1
             
-            # Logging
             if global_step % log_interval == 0:
-                print(f"[Epoch {epoch+1}/{epochs}] "
-                      f"[Step {global_step}] "
-                      f"loss_total={metrics['loss_total']:.4f} | "
+                print(f"[Epoch {epoch+1}/{epochs}] [Step {global_step}] "
+                      f"total={metrics['loss_total']:.4f} | "
                       f"recon={metrics['loss_recon']:.4f} | "
                       f"align={metrics['loss_alignment']:.4f} | "
-                      f"sigma={metrics.get('mean_sigma', 0):.3f}")
+                      f"σ_img={metrics.get('sigma_img_mean', 0):.3f} | "
+                      f"σ_txt={metrics.get('sigma_text_mean', 0):.3f}")
             
             global_step += 1
         
         # Epoch summary
-        n_batches = len(dataloader)
-        print(f"\n=== Epoch {epoch+1} Summary ===")
+        print(f"\n=== Epoch {epoch+1} ===")
         for k, v in epoch_losses.items():
             print(f"  avg_{k}: {v/n_batches:.4f}")
         
@@ -281,24 +276,21 @@ def train(cfg):
                 'epoch': epoch + 1,
                 'model_state': model.state_dict(),
                 'optimizer_state': optimizer.state_dict(),
-                'scheduler_state': scheduler.state_dict(),
                 'config': cfg,
             }, ckpt_path)
-            print(f"[OK] Checkpoint saved: {ckpt_path}\n")
+            print(f"[OK] Saved: {ckpt_path}\n")
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', type=str, default='configs/default.yaml')
-    parser.add_argument('--device', type=str, default=None)
     args = parser.parse_args()
     
-    # Load config
     cfg_path = Path(args.config)
     if cfg_path.exists():
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f)
-        print(f"[OK] Loaded config from {args.config}")
+        print(f"[OK] Config loaded: {args.config}")
     else:
         print(f"[WARN] Config not found: {args.config}, using defaults")
         cfg = {}

@@ -1,7 +1,6 @@
 """
-VAE Encoder + Decoder for image latent compression.
-Encoder outputs a latent point z (not a distribution — KL is handled separately).
-Decoder uses skip connections from encoder for high-frequency detail preservation.
+VAE Encoder that outputs a Gaussian distribution (μ, logσ), not a point.
+VAE Decoder reconstructs image from a sampled latent z ~ N(μ, σ²).
 """
 
 import torch
@@ -19,10 +18,8 @@ class ResBlock(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
         self.norm2 = nn.GroupNorm(8, out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        
-        # Skip connection projection if channel dims differ
         self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
-    
+
     def forward(self, x):
         h = F.silu(self.norm1(x))
         h = self.conv1(h)
@@ -33,84 +30,87 @@ class ResBlock(nn.Module):
 
 class VAEEncoder(nn.Module):
     """
-    Hierarchical encoder that outputs a single latent point z_img.
-    No KL head here — KL loss is computed externally against N(0,I).
-    Skip connections are returned for decoder use.
+    Encoder that outputs a Gaussian distribution over latent space.
+    Outputs (μ, logσ) instead of a single point z.
+    
+    Reparameterization trick: z = μ + σ · ε,  ε ~ N(0, I)
     """
     def __init__(self, in_channels=3, latent_dim=768, hidden_dims=[128, 256, 512, 512]):
         super().__init__()
+        self.latent_dim = latent_dim
         
-        # Input conv
         self.conv_in = nn.Conv2d(in_channels, hidden_dims[0], 3, padding=1)
         
-        # Hierarchical downsampling blocks
         self.blocks = nn.ModuleList()
         self.downs = nn.ModuleList()
-        self.skip_channels = []  # Store channel dims for decoder skip connections
         
         for i, dim in enumerate(hidden_dims):
             self.blocks.append(nn.Sequential(
                 ResBlock(dim),
                 ResBlock(dim),
             ))
-            self.skip_channels.append(dim)
-            
-            # Downsample except last block
             if i < len(hidden_dims) - 1:
                 self.downs.append(nn.Conv2d(dim, dim, 3, stride=2, padding=1))
         
-        # Final layers before latent
         last_dim = hidden_dims[-1]
         self.norm_final = nn.GroupNorm(8, last_dim)
-        self.conv_final = nn.Conv2d(last_dim, latent_dim, 3, padding=1)
         
-        # Spatial size after all downsampling: H/2^(len(hidden_dims)-1)
-        # e.g. 512 → 64 if 4 blocks with downsample each time
+        # TWO heads: mean and log-variance
+        self.mu_head = nn.Conv2d(last_dim, latent_dim, 3, padding=1)
+        self.logsigma_head = nn.Conv2d(last_dim, latent_dim, 3, padding=1)
         
-    def forward(self, x):
+    def forward(self, x, return_z=True):
         """
+        Args:
+            x: [B, C, H, W] input image
+            return_z: if True, also return reparameterized sample z ~ N(μ, σ²)
+        
         Returns:
-            z: [B, latent_dim] latent point
-            skips: list of [B, C, H, W] feature maps for decoder skip connections
+            mu:     [B, latent_dim] mean of latent distribution
+            logsigma:[B, latent_dim] log standard deviation
+            z:      [B, latent_dim] sampled latent (if return_z=True)
+            skips:  list of skip connection feature maps
         """
         skips = []
+        h = self.conv_in(x)
         
-        h = self.conv_in(x)  # [B, hidden_dims[0], H, W]
-        
-        for i, (block, down) in enumerate(zip(self.blocks, self.downs)):
+        for block, down in zip(self.blocks, self.downs):
             h = block(h)
             skips.append(h)
-            h = down(h)  # downsample
+            h = down(h)
         
         # Final block (no downsample)
         h = self.blocks[-1](h)
         skips.append(h)
         
-        # Project to latent
         h = F.silu(self.norm_final(h))
-        z = self.conv_final(h)  # [B, latent_dim, H', W']
         
-        # Global average pooling → single latent point
-        z = z.mean(dim=[2, 3])  # [B, latent_dim]
+        mu = self.mu_head(h).mean(dim=[2, 3])      # [B, D]
+        logsigma = self.logsigma_head(h).mean(dim=[2, 3])  # [B, D]
         
-        return z, skips
+        # Clamp for stability
+        logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
+        
+        if return_z:
+            sigma = torch.exp(logsigma)
+            eps = torch.randn_like(mu)
+            z = mu + sigma * eps  # reparameterized sample
+            return z, mu, logsigma, skips
+        
+        return mu, logsigma, skips
 
 
 class VAEDecoder(nn.Module):
     """
-    Decoder that reconstructs image from latent z.
+    Decoder that reconstructs image from a latent z.
     Uses skip connections from encoder for high-frequency detail.
     """
     def __init__(self, latent_dim=768, hidden_dims=[128, 256, 512, 512], out_channels=3):
         super().__init__()
-        
-        # Reverse hidden_dims for decoder (upsampling)
         self.hidden_dims_rev = list(reversed(hidden_dims))
         
-        # Project from latent to feature map
         self.from_latent = nn.ConvTranspose2d(latent_dim, self.hidden_dims_rev[0], 4, stride=2, padding=1)
         
-        # Upsampling blocks with skip connections
         self.blocks = nn.ModuleList()
         self.ups = nn.ModuleList()
         
@@ -119,58 +119,41 @@ class VAEDecoder(nn.Module):
                 ResBlock(self.hidden_dims_rev[i]),
                 ResBlock(self.hidden_dims_rev[i]),
             ))
-            # Upsample
             self.ups.append(nn.ConvTranspose2d(self.hidden_dims_rev[i], self.hidden_dims_rev[i+1], 4, stride=2, padding=1))
         
-        # Final block
         self.blocks.append(nn.Sequential(
             ResBlock(self.hidden_dims_rev[-1]),
             ResBlock(self.hidden_dims_rev[-1]),
         ))
         
-        # Output conv
         self.norm_out = nn.GroupNorm(8, self.hidden_dims_rev[-1])
         self.conv_out = nn.Conv2d(self.hidden_dims_rev[-1], out_channels, 3, padding=1)
         
     def forward(self, z, skips):
         """
         Args:
-            z: [B, latent_dim] latent point
-            skips: list of feature maps from encoder (skip connections)
+            z: [B, latent_dim] latent vector (deterministic, from reparameterization)
+            skips: list of skip connection feature maps from encoder
         
         Returns:
-            x_recon: [B, 3, H, W] reconstructed image
+            x_recon: [B, C, H, W] reconstructed image
         """
-        # Reverse skips to match decoder order
         skips = list(reversed(skips))
         
-        # Expand latent to feature map
-        h = self.from_latent(z[:, :, None, None])  # [B, hidden_dims_rev[0], 2, 2]
+        # Expand z to spatial feature map
+        h = self.from_latent(z[:, :, None, None])  # [B, dim_rev[0], 2, 2]
         
         for i, (block, up) in enumerate(zip(self.blocks, self.ups)):
-            # Add skip connection (channel attention via 1x1 conv if dims differ)
             skip = skips[i]
-            
-            # Handle spatial size mismatch (decoder upsamples, skip stays same spatial size)
             if h.shape[2:] != skip.shape[2:]:
-                # Interpolate h to match skip spatial size
                 h = F.interpolate(h, size=skip.shape[2:], mode='bilinear', align_corners=False)
-            
-            # Channel dim mismatch: project skip if needed
-            if h.shape[1] != skip.shape[1]:
-                skip = nn.functional.pad if h.shape[1] > skip.shape[1] else nn.Identity()
-            
-            h = h + skip * 0.5  # Additive skip connection (stabilized)
+            h = h + skip * 0.5
             h = block(h)
-            
             if i < len(self.ups):
                 h = up(h)
         
-        # Final skip
         h = h + skips[-1] * 0.5
         h = self.blocks[-1](h)
-        
-        # Output
         h = F.silu(self.norm_out(h))
         x_recon = self.conv_out(h)
         
@@ -179,7 +162,8 @@ class VAEDecoder(nn.Module):
 
 class VAE(nn.Module):
     """
-    Full VAE: Encoder → latent point → Decoder
+    Full VAE: Encoder outputs Gaussian → Reparameterize → Decoder
+    Standard VAE training: L_recon + β·KL(q(z|x)||N(0,I))
     """
     def __init__(self, in_channels=3, latent_dim=768, hidden_dims=[128, 256, 512, 512]):
         super().__init__()
@@ -187,15 +171,21 @@ class VAE(nn.Module):
         self.decoder = VAEDecoder(latent_dim, hidden_dims, in_channels)
         
     def forward(self, x):
-        z, skips = self.encoder(x)
+        """Standard VAE forward. Returns reconstruction and KL loss components."""
+        z, mu, logsigma, skips = self.encoder(x)
         x_recon = self.decoder(z, skips)
-        return x_recon, z
+        
+        # Standard VAE KL: KL(q(z|x) || N(0,I))
+        # = -0.5 * sum(1 + log(σ²) - μ² - σ²)
+        kl = -0.5 * torch.mean(1 + logsigma - mu.pow(2) - logsigma.exp())
+        
+        return x_recon, z, mu, logsigma, kl
     
     def encode(self, x):
-        z, _ = self.encoder(x)
-        return z
+        """Encode to (mu, logsigma) — no sampling."""
+        mu, logsigma, skips = self.encoder(x, return_z=False)
+        return mu, logsigma, skips
     
-    def decode(self, z):
-        # For decoder-only use (requires skips to be passed externally)
-        # This is a placeholder — full decode needs skips from a forward pass
-        raise NotImplementedError("Use forward() for decoding with skip connections")
+    def decode(self, z, skips):
+        """Decode from a pre-computed z."""
+        return self.decoder(z, skips)
