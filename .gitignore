@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.pt
+checkpoints/
+*.ckpt
+.vscode/
+.idea/
+*.log
+data/
+wandb/
+tensorboard/

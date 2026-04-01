@@ -1,0 +1,50 @@
+model:
+  name: "alignment_vae"
+  latent_dim: 768
+  image_channels: 3
+  hidden_dims: [128, 256, 512, 512]
+  use_skip_connections: true
+  
+  # Text encoder config
+  text_encoder_model: "ViT-L/14"       # Open CLIP model
+  text_encoder_pretrained: "openai"    # Pretrained weights source
+  freeze_text_encoder: true            # Keep CLIP frozen during VAE training
+  text_gaussian_hidden: 768            # Hidden dim for μ/σ prediction heads
+
+training:
+  batch_size: 32
+  num_workers: 4
+  epochs: 100
+  lr: 1.0e-4
+  lr_text_adapter: 5.0e-5              # Higher LR for newly added Gaussian heads
+  warmup_epochs: 5
+  
+  # Loss weights
+  weight_recon: 1.0
+  weight_kl: 1.0e-6
+  weight_alignment: 0.1                # Weight for gaussian alignment loss
+  
+  # Gaussian alignment temperature (for numerical stability)
+  alignment_temp: 1.0
+  
+  # Gradient clipping
+  grad_clip: 1.0
+  
+  # Logging
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 10
+  
+  # Dataset (COCO Captions / LAION + captions)
+  dataset: "coco"                      # coco | laion | dummy
+  data_root: "./data"
+  caption_file: "./data/captions.csv"
+
+optimizer:
+  type: "adamw"
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+
+scheduler:
+  type: "cosine"
+  warmup_type: "linear"
