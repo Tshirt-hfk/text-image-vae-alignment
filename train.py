@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import yaml
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -36,6 +37,37 @@ from model.vae import VAE, VAE_models
 
 import util.misc as misc
 import util.lr_sched as lr_sched
+
+
+def get_kl_anneal_factor(epoch: float, args) -> float:
+    """Compute KL annealing factor (0 → 1) based on current epoch.
+
+    Supports three strategies:
+        - "linear":  linearly ramp from 0 to 1 over [0, kl_anneal_epochs)
+        - "cosine":  cosine ramp (slow start, fast middle, slow end)
+        - "constant": no annealing, always 1.0
+
+    Args:
+        epoch: current fractional epoch (e.g. 3.5 = halfway through epoch 4)
+        args: must have .kl_anneal_strategy and .kl_anneal_epochs
+
+    Returns:
+        factor in [0, 1]
+    """
+    strategy = getattr(args, 'kl_anneal_strategy', 'linear')
+    anneal_epochs = getattr(args, 'kl_anneal_epochs', 0)
+
+    if strategy == 'constant' or anneal_epochs <= 0:
+        return 1.0
+
+    progress = min(epoch / anneal_epochs, 1.0)
+
+    if strategy == 'linear':
+        return progress
+    elif strategy == 'cosine':
+        return 0.5 * (1.0 - math.cos(math.pi * progress))
+    else:
+        return 1.0
 
 
 # ============================================================================
@@ -61,6 +93,8 @@ def get_args_parser():
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Per-GPU batch size')
+    parser.add_argument('--accum_iter', type=int, default=None,
+                        help='Gradient accumulation steps (effective batch = batch_size * accum_iter * num_gpus)')
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--blr', type=float, default=None,
                         help='Base LR: actual = blr * eff_batch / 256')
@@ -69,6 +103,12 @@ def get_args_parser():
     parser.add_argument('--warmup_epochs', type=int, default=None)
     parser.add_argument('--weight_decay', type=float, default=None)
     parser.add_argument('--grad_clip', type=float, default=None)
+
+    # KL annealing
+    parser.add_argument('--kl_anneal_strategy', type=str, default=None,
+                        help='KL annealing strategy: linear | cosine | constant')
+    parser.add_argument('--kl_anneal_epochs', type=float, default=None,
+                        help='Number of epochs to anneal KL weight from 0 to 1')
 
     # dataset
     parser.add_argument('--data_path', type=str, default=None)
@@ -123,6 +163,8 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     # Training
     args.epochs = args.epochs or train_cfg.get('epochs', 100)
     args.batch_size = args.batch_size or train_cfg.get('batch_size', 32)
+    args.accum_iter = (args.accum_iter if args.accum_iter is not None
+                       else train_cfg.get('accum_iter', 1))
     args.warmup_epochs = (args.warmup_epochs if args.warmup_epochs is not None
                           else train_cfg.get('warmup_epochs', 5))
     args.weight_decay = (args.weight_decay if args.weight_decay is not None
@@ -142,6 +184,12 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.weight_alignment = float(train_cfg.get('weight_alignment', 0.1))
     args.weight_label_entropy = float(train_cfg.get('weight_label_entropy', 0.01))
     args.alignment_temp = float(train_cfg.get('alignment_temp', 1.0))
+
+    # KL annealing
+    args.kl_anneal_strategy = (args.kl_anneal_strategy
+                               or train_cfg.get('kl_anneal_strategy', 'linear'))
+    args.kl_anneal_epochs = (args.kl_anneal_epochs if args.kl_anneal_epochs is not None
+                             else float(train_cfg.get('kl_anneal_epochs', 10)))
 
     # Dataset
     args.data_path = args.data_path or train_cfg.get('data_root', './data/imagenet')
@@ -418,35 +466,52 @@ def train_one_epoch(
     log_writer=None,
     args=None,
 ):
-    """Train for one epoch with per-iteration LR scheduling."""
+    """Train for one epoch with per-iteration LR scheduling and gradient accumulation."""
     model.train()
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = f'[Epoch {epoch + 1}/{args.epochs}]'
     print_freq = args.log_freq
+    accum_iter = getattr(args, 'accum_iter', 1)
 
     optimizer.zero_grad()
 
     for step, (images, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-        lr_sched.adjust_learning_rate(
-            optimizer, step / len(data_loader) + epoch, args
-        )
+        # Only adjust LR at the boundary of each accumulation window
+        if step % accum_iter == 0:
+            fractional_epoch = step / len(data_loader) + epoch
+            lr_sched.adjust_learning_rate(optimizer, fractional_epoch, args)
+
+        # KL annealing: ramp KL weight from 0 → 1 over kl_anneal_epochs
+        fractional_epoch = step / len(data_loader) + epoch
+        kl_anneal_factor = get_kl_anneal_factor(fractional_epoch, args)
 
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        x_recon, loss, metrics = model(images, labels)
+        # Use no_sync context for non-update steps in DDP to avoid redundant all-reduce
+        if accum_iter > 1 and hasattr(model, 'no_sync'):
+            ctx = model.no_sync if (step + 1) % accum_iter != 0 else nullcontext
+        else:
+            ctx = nullcontext
 
-        loss_value = loss.item()
+        with ctx():
+            x_recon, loss, metrics = model(images, labels, kl_anneal_factor=kl_anneal_factor)
+            loss = loss / accum_iter  # Normalize loss by accumulation steps
+
+        loss_value = loss.item() * accum_iter  # Un-scale for logging (show true per-sample loss)
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training", flush=True)
             sys.exit(1)
 
-        optimizer.zero_grad()
         loss.backward()
-        if args.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
+
+        # Optimizer step at the end of each accumulation window
+        if (step + 1) % accum_iter == 0:
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
 
         torch.cuda.synchronize()
 
@@ -457,6 +522,7 @@ def train_one_epoch(
         metric_logger.update(loss_label_ent=metrics.get('loss_label_entropy', 0))
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
+        metric_logger.update(kl_anneal=kl_anneal_factor)
 
         loss_value_reduce = misc.all_reduce_mean(loss_value)
 
@@ -468,6 +534,7 @@ def train_one_epoch(
             log_writer.add_scalar('train/loss_kl_vae', metrics.get('loss_kl_vae', 0), epoch_1000x)
             log_writer.add_scalar('train/loss_label_entropy', metrics.get('loss_label_entropy', 0), epoch_1000x)
             log_writer.add_scalar('train/mean_sigma_label', metrics.get('mean_sigma_label', 0), epoch_1000x)
+            log_writer.add_scalar('train/kl_anneal_factor', kl_anneal_factor, epoch_1000x)
             log_writer.add_scalar('train/lr', lr, epoch_1000x)
 
     metric_logger.synchronize_between_processes()
@@ -599,9 +666,12 @@ def _print_config(args):
         ("double_z",              str(args.double_z)),
     ])
 
+    eff_bs = args.batch_size * args.accum_iter * getattr(args, 'world_size', 1)
     _section("Training", [
         ("epochs",               str(args.epochs)),
         ("batch_size (per GPU)", str(args.batch_size)),
+        ("accum_iter",           str(args.accum_iter)),
+        ("effective batch size", str(eff_bs)),
         ("lr / lr_label_encoder", f"{args.lr:.1e} / {args.lr_label_encoder:.1e}"),
         ("lr_schedule",          str(args.lr_schedule)),
         ("warmup_epochs",        str(args.warmup_epochs)),
@@ -616,6 +686,8 @@ def _print_config(args):
         ("label_entropy",       str(args.weight_label_entropy)),
         ("alignment_temp",      str(args.alignment_temp)),
         ("label_init_logsigma", str(args.label_init_logsigma)),
+        ("kl_anneal_strategy",  str(args.kl_anneal_strategy)),
+        ("kl_anneal_epochs",    str(args.kl_anneal_epochs)),
     ])
 
     _section("Data", [
@@ -658,8 +730,8 @@ def main(args):
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Resolve learning rate
-    eff_batch_size = args.batch_size * num_tasks
+    # Resolve learning rate (effective batch accounts for accumulation)
+    eff_batch_size = args.batch_size * args.accum_iter * num_tasks
     if args.blr is not None:
         args.lr = args.blr * eff_batch_size / 256
     lr_scale_label = args.lr_label_encoder / args.yaml_config.get('training', {}).get('lr', 1e-4)

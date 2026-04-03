@@ -102,6 +102,7 @@ class AlignmentVAE(nn.Module):
         x: torch.Tensor,
         labels: torch.Tensor,
         return_latents: bool = False,
+        kl_anneal_factor: float = 1.0,  # only applies to VAE KL, not alignment
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor, Dict],
         Tuple[torch.Tensor, torch.Tensor, Dict, Dict],
@@ -111,6 +112,8 @@ class AlignmentVAE(nn.Module):
             x:              [B, C, H, W] input images
             labels:         [B] integer class labels
             return_latents: if True, also return all latent variables
+            kl_anneal_factor: annealing multiplier for VAE KL loss (0→1),
+                              only applied to weight_kl (not alignment)
 
         Returns:
             x_recon: [B, C, H, W]
@@ -143,8 +146,11 @@ class AlignmentVAE(nn.Module):
         # Label entropy: sum over latent dims, mean over batch
         L_label_entropy = logsigma_label.sum(dim=(1, 2, 3)).mean()
 
+        # Apply KL annealing factor only to VAE KL (not alignment)
+        effective_weight_kl = self.weight_kl * kl_anneal_factor
+
         w_recon = self.weight_recon * L_recon
-        w_kl = self.weight_kl * L_kl_vae
+        w_kl = effective_weight_kl * L_kl_vae
         w_align = self.weight_alignment * L_kl_align
         w_label_ent = self.weight_label_entropy * L_label_entropy
         loss = w_recon + w_kl + w_align + w_label_ent
@@ -155,6 +161,7 @@ class AlignmentVAE(nn.Module):
             "loss_kl_vae": w_kl.item(),
             "loss_alignment": w_align.item(),
             "loss_label_entropy": w_label_ent.item(),
+            "kl_anneal_factor": kl_anneal_factor,
             "mean_mu_img_norm": mu_img.norm(dim=-1).mean().item(),
             "mean_sigma_img": torch.exp(logsigma_img).mean().item(),
             "mean_sigma_label": torch.exp(logsigma_label).mean().item(),

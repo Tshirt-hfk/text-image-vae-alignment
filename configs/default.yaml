@@ -19,42 +19,47 @@ model:
   label_depth: 12                       # Number of AdaLN blocks
   label_num_heads: 12                   # Attention heads
   label_mlp_ratio: 4.0
-  label_in_context_len: 32             # In-context label tokens
-  label_in_context_start: 4            # Layer to inject in-context tokens
-  label_init_logsigma: -2.0            # Initial log(σ) for Gaussian heads
+  label_in_context_len: 32              # In-context label tokens
+  label_in_context_start: 4             # Layer to inject in-context tokens
+  label_init_logsigma: -2.0             # Initial log(σ) for Gaussian heads
 
 training:
-  # Per-GPU batch size. Effective batch = batch_size * num_gpus
-  batch_size: 32
-  num_workers: 4
+  # Per-GPU batch size. Effective batch = batch_size * accum_iter * num_gpus
+  batch_size: 64
+  accum_iter: 2                         # Gradient accumulation steps (increase to simulate larger batch)
+  num_workers: 8
   epochs: 100
 
   # Learning rate (absolute, for VAE branch)
   lr: 1.0e-4
-  lr_label_encoder: 5.0e-5             # Separate LR for label encoder (scaled via lr_scale)
+  lr_label_encoder: 5.0e-5              # Separate LR for label encoder (scaled via lr_scale)
   # Alternatively use base_lr: actual_lr = blr * effective_batch / 256
   # blr: 5.0e-5
 
   # LR schedule
-  lr_schedule: "cosine"                # cosine | constant
+  lr_schedule: "cosine"                 # cosine | constant
   warmup_epochs: 5
   min_lr: 0.0
 
   # Loss weights (KL/alignment/label_ent use sum-over-latent reduction)
   weight_recon: 1.0
-  weight_kl: 1e-4                      # VAE KL regularization
-  weight_alignment: 1.2e-4             # Spatial Gaussian alignment (sum reduction, matches prev mean+0.5 strength)
-  weight_label_entropy: 2.5e-6         # Label σ entropy regularization (sum reduction, matches prev mean+0.01)
+  weight_kl: 5e-5                       # VAE KL regularization (β_eff ≈ 0.2 with sum reduction over 4096 latent elements)
+  weight_alignment: 1.2e-4              # Spatial Gaussian alignment (sum reduction, matches prev mean+0.5 strength)
+  weight_label_entropy: 2.5e-6          # Label σ entropy regularization (sum reduction, matches prev mean+0.01)
 
   # Gaussian alignment temperature
   alignment_temp: 1.0
+
+  # KL Annealing: gradually ramp up KL weight from 0 → 1 to prevent posterior collapse
+  kl_anneal_strategy: "linear"          # linear | cosine | constant (no annealing)
+  kl_anneal_epochs: 10                  # epochs to fully ramp up KL weight (0 = disabled)
 
   # Gradient clipping
   grad_clip: 1.0
 
   # Logging and checkpointing
-  log_interval: 100                    # Print & tensorboard log every N steps
-  save_interval: 10                    # Save checkpoint every N epochs
+  log_interval: 100                     # Print & tensorboard log every N steps
+  save_interval: 10                     # Save checkpoint every N epochs
 
   # Validation split
   val_split: 0.1
