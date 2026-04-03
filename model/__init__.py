@@ -1,4 +1,6 @@
-# Empty init file for model package
-from .vae import VAE, VAEEncoder, VAEDecoder
-from .text_encoder import GaussianTextEncoder, build_text_encoder
+from .vae import VAE, VAEEncoder, VAEDecoder, VAE_B, VAE_L, VAE_H, VAE_models
+from .text_encoder import (
+    SpatialLabelEncoder, SpatialLabelEncoder_models,
+    SpatialLabelEncoder_B, SpatialLabelEncoder_L, SpatialLabelEncoder_H,
+)
 from .alignment_vae import AlignmentVAE

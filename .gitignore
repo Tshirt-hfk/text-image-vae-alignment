@@ -4,11 +4,11 @@ __pycache__/
 dist/
 build/
 *.pt
-checkpoints/
 *.ckpt
+checkpoints/
 .vscode/
 .idea/
 *.log
 data/
 wandb/
-tensorboard/
+logs/

@@ -1,201 +1,265 @@
 """
-Text Encoder with Gaussian Output.
+Spatial Label Encoder → N(μ, σ²) [B, h, w, D].
 
-Instead of outputting a single embedding vector,
-this encoder outputs a Gaussian distribution parameters (μ, logσ)
-representing the semantic region described by the text.
-
-Architecture:
-    Text → Base Encoder (CLIP/T5) → [μ_head, logσ_head] → N(μ, σ²I)
+Architecture: label → LabelEmbedder → conditioning
+    learnable spatial tokens → AdaLN Transformer (RoPE, SwiGLU, in-context injection)
+    → μ_head, logσ_head → spatial Gaussian matching VAE latent shape.
 """
+
+import math
+from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+
+from util.model_util import VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed, RMSNorm
 
 
-class GaussianTextEncoder(nn.Module):
-    """
-    Text encoder that outputs a Gaussian distribution over latent space.
-    
-    The Gaussian models the "semantic region" described by the text:
-    - μ: center of the semantic region
-    - σ: radius/spread of the region (learned, not fixed)
-    
-    During training, the image latent z_img is encouraged to have
-    high probability density under this distribution: p(z_img | text)
-    """
-    def __init__(
-        self,
-        text_encoder,
-        latent_dim=768,
-        hidden_dim=None,
-        freeze_base=True,
-    ):
+# ============================================================================
+# Transformer Components
+# ============================================================================
+
+def modulate(x, shift, scale):
+    """AdaLN modulation: x * (1 + scale) + shift."""
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+
+class LabelEmbedder(nn.Module):
+    """Class label → vector embedding."""
+
+    def __init__(self, num_classes: int, hidden_size: int):
         super().__init__()
-        
-        self.base_encoder = text_encoder  # e.g. CLIP text encoder (frozen)
-        self.latent_dim = latent_dim
-        self.freeze_base = freeze_base
-        
-        # Get base encoder embedding dimension
-        if hasattr(text_encoder, 'text_projection'):
-            # CLIP
-            self.base_dim = text_encoder.text_projection.shape[-1]
-        elif hasattr(text_encoder, 'config'):
-            # T5/Transformer
-            self.base_dim = text_encoder.config.d_model
-        else:
-            self.base_dim = latent_dim
-        
-        hidden_dim = hidden_dim or max(self.base_dim, latent_dim)
-        
-        # Adapter network: base embedding → Gaussian parameters
-        # Two separate heads for μ and logσ (allow independent control)
-        self.net = nn.Sequential(
-            nn.Linear(self.base_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.GELU(),
+        self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
+        self.num_classes = num_classes
+
+    def forward(self, labels: torch.Tensor) -> torch.Tensor:
+        return self.embedding_table(labels)
+
+
+class Attention(nn.Module):
+    """Multi-head self-attention with RoPE and QK-norm."""
+
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True,
+                 attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, rope):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+
+        q, k = self.q_norm(q), self.k_norm(k)
+        q, k = rope(q), rope(k)
+
+        scale = 1 / math.sqrt(q.size(-1))
+        with torch.amp.autocast('cuda', enabled=False):
+            attn = q.float() @ k.float().transpose(-2, -1) * scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = torch.dropout(attn, self.attn_drop.p if self.training else 0., train=self.training)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        return self.proj_drop(self.proj(x))
+
+
+class SwiGLUFFN(nn.Module):
+    """SwiGLU feed-forward network."""
+
+    def __init__(self, dim: int, hidden_dim: int, drop=0.0, bias=True):
+        super().__init__()
+        hidden_dim = int(hidden_dim * 2 / 3)
+        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
+        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x1, x2 = self.w12(x).chunk(2, dim=-1)
+        return self.w3(self.drop(F.silu(x1) * x2))
+
+
+class AdaLNBlock(nn.Module):
+    """Transformer block with adaLN conditioning, RoPE attention, SwiGLU FFN."""
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True,
+                              qk_norm=True, attn_drop=attn_drop, proj_drop=proj_drop)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        self.mlp = SwiGLUFFN(hidden_size, int(hidden_size * mlp_ratio), drop=proj_drop)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
-        
-        self.mu_head = nn.Linear(hidden_dim, latent_dim)
-        self.logsigma_head = nn.Linear(hidden_dim, latent_dim)
-        
-        # Initialize σ to small values (tight distributions)
+
+    def forward(self, x, c, feat_rope=None):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+# ============================================================================
+# Spatial Label Encoder
+# ============================================================================
+
+class SpatialLabelEncoder(nn.Module):
+    """
+    label → LabelEmbedder → conditioning
+    learnable spatial tokens + pos_embed → AdaLN blocks → reshape → (μ, logσ)
+    Output: [B, h, w, latent_dim] matching VAE encoder output.
+    """
+
+    def __init__(self, input_size: int = 256, patch_size: int = 16,
+                 num_classes: int = 1000, hidden_size: int = 768,
+                 latent_dim: int = 16, depth: int = 12, num_heads: int = 12,
+                 mlp_ratio: float = 4.0, attn_drop: float = 0.0,
+                 proj_drop: float = 0.0, in_context_len: int = 32,
+                 in_context_start: int = 4, init_logsigma: float = -2.0):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.latent_dim = latent_dim
+        self.num_heads = num_heads
+        self.in_context_len = in_context_len
+        self.in_context_start = in_context_start
+        self.hw = input_size // patch_size
+        self.num_patches = self.hw * self.hw
+
+        # Label embedding
+        self.y_embedder = LabelEmbedder(num_classes, hidden_size)
+
+        # Learnable spatial tokens + fixed sin-cos pos embed
+        self.spatial_tokens = nn.Parameter(torch.zeros(1, self.num_patches, hidden_size))
+        nn.init.normal_(self.spatial_tokens, std=0.02)
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches, hidden_size), requires_grad=False)
+
+        # In-context label injection tokens
+        if in_context_len > 0:
+            self.in_context_posemb = nn.Parameter(
+                torch.zeros(1, in_context_len, hidden_size), requires_grad=True)
+            nn.init.normal_(self.in_context_posemb, std=0.02)
+
+        # RoPE (with / without prefix tokens)
+        half_head = hidden_size // num_heads // 2
+        self.feat_rope = VisionRotaryEmbeddingFast(
+            dim=half_head, pt_seq_len=self.hw, num_cls_token=0)
+        self.feat_rope_incontext = VisionRotaryEmbeddingFast(
+            dim=half_head, pt_seq_len=self.hw, num_cls_token=in_context_len)
+
+        # Transformer blocks (dropout in middle layers only)
+        self.blocks = nn.ModuleList([
+            AdaLNBlock(
+                hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                attn_drop=attn_drop if (depth // 4 <= i < depth // 4 * 3) else 0.0,
+                proj_drop=proj_drop if (depth // 4 <= i < depth // 4 * 3) else 0.0,
+            ) for i in range(depth)
+        ])
+
+        # Gaussian output heads
+        self.norm_final = RMSNorm(hidden_size)
+        self.mu_head = nn.Linear(hidden_size, latent_dim)
+        self.logsigma_head = nn.Linear(hidden_size, latent_dim)
+
+        self._initialize_weights(init_logsigma)
+
+    def _initialize_weights(self, init_logsigma: float):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        # Sin-cos positional embedding
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], self.hw)
+        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+
+        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Zero-out adaLN modulation
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+        # Gaussian heads: zero mu, logsigma bias = init_logsigma
+        nn.init.zeros_(self.mu_head.weight)
+        nn.init.zeros_(self.mu_head.bias)
         nn.init.zeros_(self.logsigma_head.weight)
-        nn.init.constant_(self.logsigma_head.bias, -2.0)  # σ ≈ 0.14
-        
-    def forward(self, text):
+        nn.init.constant_(self.logsigma_head.bias, init_logsigma)
+
+    def forward(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            text: text input (string list or tokenized tensor depending on base encoder)
-        
+            labels: [B] integer class labels
         Returns:
-            mu: [B, latent_dim] mean of text semantic region
-            logsigma: [B, latent_dim] log standard deviation
+            mu, logsigma: [B, h, w, latent_dim]
         """
-        if self.freeze_base:
-            with torch.no_grad():
-                h = self.base_encoder(text)
-        else:
-            h = self.base_encoder(text)
-        
-        # Project to base dimension if needed
-        if hasattr(self.base_encoder, 'text_projection'):
-            # CLIP: output is already projected
-            h = h / h.norm(dim=-1, keepdim=True)  # normalize CLIP embeddings
-        
-        h = self.net(h)
-        
-        mu = self.mu_head(h)
-        logsigma = self.logsigma_head(h)
-        
-        # Clamp σ for numerical stability
-        # σ ∈ [e^-5, e^2] ≈ [0.007, 7.4]
-        logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
-        
-        return mu, logsigma
-    
-    def sample(self, mu, logsigma):
-        """
-        Reparameterization trick: z = μ + σ · ε,  ε ~ N(0, I)
-        Only used if we want stochastic text representations.
-        For alignment, we use the deterministic μ directly.
-        """
-        sigma = torch.exp(logsigma)
-        eps = torch.randn_like(mu)
-        return mu + sigma * eps
-    
-    def log_prob(self, z, mu, logsigma):
-        """
-        Compute log probability of z under N(μ, σ²I).
-        
-        log p(z|μ,σ) = -Σ [(z_i - μ_i)² / (2σ_i²)] - Σ log(σ_i) - (D/2)log(2π)
-        
-        Args:
-            z: [B, D] points to evaluate
-            mu: [B, D] distribution mean
-            logsigma: [B, D] log standard deviation
-        
-        Returns:
-            log_prob: [B] log probability for each point
-        """
-        sigma = torch.exp(logsigma)
-        D = z.shape[-1]
-        
-        # Mahalanobis distance (diagonal covariance)
-        diff = z - mu
-        mahalanobis = torch.sum(diff ** 2 / (2 * sigma ** 2 + 1e-8), dim=-1)
-        
-        # Log determinant of covariance matrix (diag → sum of log σ)
-        log_det = torch.sum(logsigma, dim=-1)
-        
-        # Log probability (constant term omitted)
-        log_prob = -mahalanobis - log_det
-        
-        return log_prob
+        B = labels.shape[0]
+        c = self.y_embedder(labels)
+        x = self.spatial_tokens.expand(B, -1, -1) + self.pos_embed
+
+        for i, block in enumerate(self.blocks):
+            if self.in_context_len > 0 and i == self.in_context_start:
+                ic_tokens = c.unsqueeze(1).expand(-1, self.in_context_len, -1)
+                x = torch.cat([ic_tokens + self.in_context_posemb, x], dim=1)
+            rope = self.feat_rope if i < self.in_context_start else self.feat_rope_incontext
+            x = block(x, c, rope)
+
+        if self.in_context_len > 0:
+            x = x[:, self.in_context_len:]
+
+        x = self.norm_final(x)
+        mu = self.mu_head(x)
+        logsigma = torch.clamp(self.logsigma_head(x), min=-5.0, max=2.0)
+
+        h = w = self.hw
+        return mu.reshape(B, h, w, -1), logsigma.reshape(B, h, w, -1)
+
+    def sample(self, mu: torch.Tensor, logsigma: torch.Tensor) -> torch.Tensor:
+        """Reparameterization: z = μ + σ·ε."""
+        return mu + torch.exp(logsigma) * torch.randn_like(mu)
 
 
-def build_text_encoder(model_name="ViT-L/14", pretrained="openai", device="cuda", freeze=True):
-    """
-    Build a CLIP-based text encoder with Gaussian output heads.
-    
-    Args:
-        model_name: CLIP model name (e.g. "ViT-L/14", "ViT-B/32")
-        pretrained: Pretrained weight source ("openai", "laion", etc.)
-        device: Device to load model on
-        freeze: Whether to freeze the base CLIP encoder
-    
-    Returns:
-        GaussianTextEncoder wrapping CLIP
-    """
-    import open_clip
-    
-    # Load base CLIP model
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name,
-        pretrained=pretrained,
-        device=device,
-    )
-    text_encoder = model.tokenizer  # we'll use the model's encode_text
-    
-    # Wrap in our Gaussian encoder
-    class CLIPTextEncoder:
-        """Thin wrapper to make CLIP model compatible with GaussianTextEncoder."""
-        def __init__(self, model):
-            self.model = model
-            self.text_projection = model.text_projection
-            self.tokenizer = model.tokenizer
-        
-        def __call__(self, text, device):
-            """
-            Encode text strings to embeddings.
-            text: list of strings
-            """
-            if isinstance(text, str):
-                text = [text]
-            
-            # Tokenize
-            tokens = self.tokenizer(text).to(device)
-            
-            # Encode
-            with torch.no_grad():
-                text_features = self.model.encode_text(tokens)
-                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-            
-            return text_features
-        
-        def to(self, device):
-            self.model = self.model.to(device)
-            return self
-    
-    clip_encoder = CLIPTextEncoder(model)
-    
-    latent_dim = model.text_projection.shape[-1]
-    gaussian_encoder = GaussianTextEncoder(
-        text_encoder=clip_encoder,
-        latent_dim=latent_dim,
-        freeze_base=freeze,
-    )
-    
-    return gaussian_encoder, clip_encoder, preprocess
+# ============================================================================
+# Factory functions
+# ============================================================================
+
+def SpatialLabelEncoder_B(input_size=256, num_classes=1000, latent_dim=16, **kw):
+    """Base — 12 layers, 768 hidden, 12 heads."""
+    return SpatialLabelEncoder(
+        input_size=input_size, patch_size=16, num_classes=num_classes,
+        hidden_size=768, latent_dim=latent_dim, depth=12, num_heads=12,
+        in_context_len=32, in_context_start=4, **kw)
+
+def SpatialLabelEncoder_L(input_size=256, num_classes=1000, latent_dim=16, **kw):
+    """Large — 24 layers, 1024 hidden, 16 heads."""
+    return SpatialLabelEncoder(
+        input_size=input_size, patch_size=16, num_classes=num_classes,
+        hidden_size=1024, latent_dim=latent_dim, depth=24, num_heads=16,
+        in_context_len=32, in_context_start=8, **kw)
+
+def SpatialLabelEncoder_H(input_size=256, num_classes=1000, latent_dim=16, **kw):
+    """Huge — 32 layers, 1280 hidden, 16 heads."""
+    return SpatialLabelEncoder(
+        input_size=input_size, patch_size=16, num_classes=num_classes,
+        hidden_size=1280, latent_dim=latent_dim, depth=32, num_heads=16,
+        in_context_len=32, in_context_start=10, **kw)
+
+SpatialLabelEncoder_models = {
+    'SLE-B': SpatialLabelEncoder_B,
+    'SLE-L': SpatialLabelEncoder_L,
+    'SLE-H': SpatialLabelEncoder_H,
+}

@@ -1,191 +1,307 @@
 """
-VAE Encoder that outputs a Gaussian distribution (μ, logσ), not a point.
-VAE Decoder reconstructs image from a sampled latent z ~ N(μ, σ²).
+Flux2-style VAE with Spatial Gaussian Latent Space.
+
+    Encoder: [B, 3, H, W] → N(μ, σ²) [B, H//16, W//16, D]
+    Decoder: [B, H//16, W//16, D] → [B, 3, H, W]
+
+Architecture: GroupNorm-32, SiLU, self-attention at bottleneck,
+mid blocks (Res-Attn-Res), 4 downsample stages = 16× compression.
 """
 
+from typing import List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+def Normalize(in_channels: int, num_groups: int = 32) -> nn.GroupNorm:
+    return nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
+
+
+# ============================================================================
+# Core blocks
+# ============================================================================
+
 class ResBlock(nn.Module):
-    """Residual block with GroupNorm and SiLU activation."""
-    def __init__(self, in_channels, out_channels=None):
+    """x → norm1 → SiLU → conv1 → norm2 → SiLU → conv2 + skip → out"""
+
+    def __init__(self, in_channels: int, out_channels: Optional[int] = None):
         super().__init__()
-        if out_channels is None:
-            out_channels = in_channels
-        self.norm1 = nn.GroupNorm(8, in_channels)
+        out_channels = out_channels or in_channels
+        self.norm1 = Normalize(in_channels)
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.norm2 = nn.GroupNorm(8, out_channels)
+        self.norm2 = Normalize(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1)
-        self.skip = nn.Conv2d(in_channels, out_channels, 1) if in_channels != out_channels else nn.Identity()
+        self.skip_proj = (nn.Conv2d(in_channels, out_channels, 1)
+                          if in_channels != out_channels else nn.Identity())
 
-    def forward(self, x):
-        h = F.silu(self.norm1(x))
-        h = self.conv1(h)
-        h = F.silu(self.norm2(h))
-        h = self.conv2(h)
-        return h + self.skip(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip_proj(x)
 
+
+class AttnBlock(nn.Module):
+    """Single-head self-attention on spatial feature maps."""
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.norm = Normalize(in_channels)
+        self.q = nn.Conv2d(in_channels, in_channels, 1)
+        self.k = nn.Conv2d(in_channels, in_channels, 1)
+        self.v = nn.Conv2d(in_channels, in_channels, 1)
+        self.proj_out = nn.Conv2d(in_channels, in_channels, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        q, k, v = self.q(h), self.k(h), self.v(h)
+        B, C, H, W = q.shape
+
+        q = q.reshape(B, C, H * W)
+        k = k.reshape(B, C, H * W)
+        v = v.reshape(B, C, H * W)
+
+        attn = torch.bmm(q.permute(0, 2, 1), k) * (C ** -0.5)
+        attn = F.softmax(attn, dim=-1)
+        h = torch.bmm(v, attn.permute(0, 2, 1)).reshape(B, C, H, W)
+        return x + self.proj_out(h)
+
+
+class Downsample(nn.Module):
+    """2× spatial downsampling with stride-2 conv (asymmetric padding)."""
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, 3, stride=2, padding=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.pad(x, (0, 1, 0, 1), mode='constant', value=0))
+
+
+class Upsample(nn.Module):
+    """2× spatial upsampling with nearest interpolation + conv."""
+
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, in_channels, 3, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.conv(F.interpolate(x, scale_factor=2.0, mode='nearest'))
+
+
+# ============================================================================
+# Encoder / Decoder
+# ============================================================================
 
 class VAEEncoder(nn.Module):
     """
-    Encoder that outputs a Gaussian distribution over latent space.
-    Outputs (μ, logσ) instead of a single point z.
-    
-    Reparameterization trick: z = μ + σ · ε,  ε ~ N(0, I)
+    [B, 3, H, W] → conv_in → {ResBlock × N, [Attn], Downsample} × 4
+    → Mid(Res-Attn-Res) → norm → SiLU → conv_out → split → (μ, logσ) [B, h, w, D]
     """
-    def __init__(self, in_channels=3, latent_dim=768, hidden_dims=[128, 256, 512, 512]):
+
+    def __init__(self, in_channels: int = 3, latent_dim: int = 16, ch: int = 128,
+                 ch_mult: Optional[List[int]] = None, num_res_blocks: int = 2,
+                 attn_resolutions: Optional[List[int]] = None,
+                 resolution: int = 256, double_z: bool = True):
         super().__init__()
+        ch_mult = ch_mult or [1, 2, 4, 4]
+        attn_resolutions = attn_resolutions or [16]
+
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
         self.latent_dim = latent_dim
-        
-        self.conv_in = nn.Conv2d(in_channels, hidden_dims[0], 3, padding=1)
-        
-        self.blocks = nn.ModuleList()
-        self.downs = nn.ModuleList()
-        
-        for i, dim in enumerate(hidden_dims):
-            self.blocks.append(nn.Sequential(
-                ResBlock(dim),
-                ResBlock(dim),
-            ))
-            if i < len(hidden_dims) - 1:
-                self.downs.append(nn.Conv2d(dim, dim, 3, stride=2, padding=1))
-        
-        last_dim = hidden_dims[-1]
-        self.norm_final = nn.GroupNorm(8, last_dim)
-        
-        # TWO heads: mean and log-variance
-        self.mu_head = nn.Conv2d(last_dim, latent_dim, 3, padding=1)
-        self.logsigma_head = nn.Conv2d(last_dim, latent_dim, 3, padding=1)
-        
-    def forward(self, x, return_z=True):
+        self.double_z = double_z
+
+        self.conv_in = nn.Conv2d(in_channels, ch, 3, padding=1)
+
+        # Downsampling stages
+        self.down = nn.ModuleList()
+        curr_res, in_ch = resolution, ch
+        for i_level in range(self.num_resolutions):
+            block, attn = nn.ModuleList(), nn.ModuleList()
+            out_ch = ch * ch_mult[i_level]
+            for _ in range(num_res_blocks):
+                block.append(ResBlock(in_ch, out_ch))
+                in_ch = out_ch
+                if curr_res in attn_resolutions:
+                    attn.append(AttnBlock(in_ch))
+            down = nn.Module()
+            down.block, down.attn = block, attn
+            down.downsample = Downsample(in_ch)
+            curr_res //= 2
+            self.down.append(down)
+
+        # Mid block
+        self.mid_block_1 = ResBlock(in_ch, in_ch)
+        self.mid_attn = AttnBlock(in_ch)
+        self.mid_block_2 = ResBlock(in_ch, in_ch)
+
+        # Output
+        self.norm_out = Normalize(in_ch)
+        out_z = 2 * latent_dim if double_z else latent_dim
+        self.conv_out = nn.Conv2d(in_ch, out_z, 3, padding=1)
+        nn.init.zeros_(self.conv_out.bias)
+
+    def forward(self, x: torch.Tensor, return_z: bool = True) -> Tuple[torch.Tensor, ...]:
         """
-        Args:
-            x: [B, C, H, W] input image
-            return_z: if True, also return reparameterized sample z ~ N(μ, σ²)
-        
-        Returns:
-            mu:     [B, latent_dim] mean of latent distribution
-            logsigma:[B, latent_dim] log standard deviation
-            z:      [B, latent_dim] sampled latent (if return_z=True)
-            skips:  list of skip connection feature maps
+        Returns (z, μ, logσ) if return_z else (μ, logσ).
+        All outputs have shape [B, h, w, D].
         """
-        skips = []
         h = self.conv_in(x)
-        
-        for block, down in zip(self.blocks, self.downs):
-            h = block(h)
-            skips.append(h)
-            h = down(h)
-        
-        # Final block (no downsample)
-        h = self.blocks[-1](h)
-        skips.append(h)
-        
-        h = F.silu(self.norm_final(h))
-        
-        mu = self.mu_head(h).mean(dim=[2, 3])      # [B, D]
-        logsigma = self.logsigma_head(h).mean(dim=[2, 3])  # [B, D]
-        
-        # Clamp for stability
+
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks):
+                h = self.down[i_level].block[i_block](h)
+                if len(self.down[i_level].attn) > i_block:
+                    h = self.down[i_level].attn[i_block](h)
+            h = self.down[i_level].downsample(h)
+
+        h = self.mid_block_2(self.mid_attn(self.mid_block_1(h)))
+        h = self.conv_out(F.silu(self.norm_out(h)))
+
+        if self.double_z:
+            mu, logvar = torch.chunk(h, 2, dim=1)
+            logsigma = 0.5 * logvar          # log(σ²) → log(σ)
+        else:
+            mu, logsigma = h, torch.zeros_like(h)
+
         logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
-        
+        mu = mu.permute(0, 2, 3, 1)
+        logsigma = logsigma.permute(0, 2, 3, 1)
+
         if return_z:
-            sigma = torch.exp(logsigma)
-            eps = torch.randn_like(mu)
-            z = mu + sigma * eps  # reparameterized sample
-            return z, mu, logsigma, skips
-        
-        return mu, logsigma, skips
+            z = mu + torch.exp(logsigma) * torch.randn_like(mu)
+            return z, mu, logsigma
+        return mu, logsigma
 
 
 class VAEDecoder(nn.Module):
     """
-    Decoder that reconstructs image from a latent z.
-    Uses skip connections from encoder for high-frequency detail.
+    z [B, h, w, D] → permute → conv_in → Mid(Res-Attn-Res)
+    → {ResBlock × (N+1), [Attn], Upsample} × 4 → norm → SiLU → conv_out → [B, 3, H, W]
     """
-    def __init__(self, latent_dim=768, hidden_dims=[128, 256, 512, 512], out_channels=3):
-        super().__init__()
-        self.hidden_dims_rev = list(reversed(hidden_dims))
-        
-        self.from_latent = nn.ConvTranspose2d(latent_dim, self.hidden_dims_rev[0], 4, stride=2, padding=1)
-        
-        self.blocks = nn.ModuleList()
-        self.ups = nn.ModuleList()
-        
-        for i in range(len(self.hidden_dims_rev) - 1):
-            self.blocks.append(nn.Sequential(
-                ResBlock(self.hidden_dims_rev[i]),
-                ResBlock(self.hidden_dims_rev[i]),
-            ))
-            self.ups.append(nn.ConvTranspose2d(self.hidden_dims_rev[i], self.hidden_dims_rev[i+1], 4, stride=2, padding=1))
-        
-        self.blocks.append(nn.Sequential(
-            ResBlock(self.hidden_dims_rev[-1]),
-            ResBlock(self.hidden_dims_rev[-1]),
-        ))
-        
-        self.norm_out = nn.GroupNorm(8, self.hidden_dims_rev[-1])
-        self.conv_out = nn.Conv2d(self.hidden_dims_rev[-1], out_channels, 3, padding=1)
-        
-    def forward(self, z, skips):
-        """
-        Args:
-            z: [B, latent_dim] latent vector (deterministic, from reparameterization)
-            skips: list of skip connection feature maps from encoder
-        
-        Returns:
-            x_recon: [B, C, H, W] reconstructed image
-        """
-        skips = list(reversed(skips))
-        
-        # Expand z to spatial feature map
-        h = self.from_latent(z[:, :, None, None])  # [B, dim_rev[0], 2, 2]
-        
-        for i, (block, up) in enumerate(zip(self.blocks, self.ups)):
-            skip = skips[i]
-            if h.shape[2:] != skip.shape[2:]:
-                h = F.interpolate(h, size=skip.shape[2:], mode='bilinear', align_corners=False)
-            h = h + skip * 0.5
-            h = block(h)
-            if i < len(self.ups):
-                h = up(h)
-        
-        h = h + skips[-1] * 0.5
-        h = self.blocks[-1](h)
-        h = F.silu(self.norm_out(h))
-        x_recon = self.conv_out(h)
-        
-        return x_recon
 
+    def __init__(self, latent_dim: int = 16, out_channels: int = 3, ch: int = 128,
+                 ch_mult: Optional[List[int]] = None, num_res_blocks: int = 2,
+                 attn_resolutions: Optional[List[int]] = None, resolution: int = 256):
+        super().__init__()
+        ch_mult = ch_mult or [1, 2, 4, 4]
+        attn_resolutions = attn_resolutions or [16]
+
+        self.num_resolutions = len(ch_mult)
+        self.num_res_blocks = num_res_blocks
+
+        bottom_res = resolution // (2 ** self.num_resolutions)
+        in_ch = ch * ch_mult[-1]
+
+        self.conv_in = nn.Conv2d(latent_dim, in_ch, 3, padding=1)
+
+        # Mid block
+        self.mid_block_1 = ResBlock(in_ch, in_ch)
+        self.mid_attn = AttnBlock(in_ch)
+        self.mid_block_2 = ResBlock(in_ch, in_ch)
+
+        # Upsampling stages
+        self.up = nn.ModuleList()
+        curr_res = bottom_res
+        for i_level in reversed(range(self.num_resolutions)):
+            block, attn = nn.ModuleList(), nn.ModuleList()
+            out_ch = ch * ch_mult[i_level]
+            for _ in range(num_res_blocks + 1):
+                block.append(ResBlock(in_ch, out_ch))
+                in_ch = out_ch
+                if curr_res in attn_resolutions:
+                    attn.append(AttnBlock(in_ch))
+            up = nn.Module()
+            up.block, up.attn = block, attn
+            up.upsample = Upsample(in_ch)
+            curr_res *= 2
+            self.up.append(up)
+
+        self.norm_out = Normalize(in_ch)
+        self.conv_out = nn.Conv2d(in_ch, out_channels, 3, padding=1)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        """z: [B, h, w, D] → x_recon: [B, C, H, W]"""
+        h = self.conv_in(z.permute(0, 3, 1, 2))
+        h = self.mid_block_2(self.mid_attn(self.mid_block_1(h)))
+
+        for i_level in range(self.num_resolutions):
+            for i_block in range(self.num_res_blocks + 1):
+                h = self.up[i_level].block[i_block](h)
+                if len(self.up[i_level].attn) > i_block:
+                    h = self.up[i_level].attn[i_block](h)
+            h = self.up[i_level].upsample(h)
+
+        return self.conv_out(F.silu(self.norm_out(h)))
+
+
+# ============================================================================
+# Full VAE
+# ============================================================================
 
 class VAE(nn.Module):
     """
-    Full VAE: Encoder outputs Gaussian → Reparameterize → Decoder
-    Standard VAE training: L_recon + β·KL(q(z|x)||N(0,I))
+    Flux2-style VAE: Image → Encoder → N(μ,σ²) → sample z → Decoder → Image.
+    No skip connections between encoder and decoder.
     """
-    def __init__(self, in_channels=3, latent_dim=768, hidden_dims=[128, 256, 512, 512]):
+
+    def __init__(self, in_channels: int = 3, latent_dim: int = 16, ch: int = 128,
+                 ch_mult: Optional[List[int]] = None, num_res_blocks: int = 2,
+                 attn_resolutions: Optional[List[int]] = None,
+                 resolution: int = 256, double_z: bool = True):
         super().__init__()
-        self.encoder = VAEEncoder(in_channels, latent_dim, hidden_dims)
-        self.decoder = VAEDecoder(latent_dim, hidden_dims, in_channels)
-        
-    def forward(self, x):
-        """Standard VAE forward. Returns reconstruction and KL loss components."""
-        z, mu, logsigma, skips = self.encoder(x)
-        x_recon = self.decoder(z, skips)
-        
-        # Standard VAE KL: KL(q(z|x) || N(0,I))
-        # = -0.5 * sum(1 + log(σ²) - μ² - σ²)
-        kl = -0.5 * torch.mean(1 + logsigma - mu.pow(2) - logsigma.exp())
-        
+        ch_mult = ch_mult or [1, 2, 4, 4]
+        attn_resolutions = attn_resolutions or [16]
+        self.latent_dim = latent_dim
+
+        self.encoder = VAEEncoder(
+            in_channels=in_channels, latent_dim=latent_dim, ch=ch,
+            ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+            attn_resolutions=attn_resolutions, resolution=resolution,
+            double_z=double_z,
+        )
+        self.decoder = VAEDecoder(
+            latent_dim=latent_dim, out_channels=in_channels, ch=ch,
+            ch_mult=ch_mult, num_res_blocks=num_res_blocks,
+            attn_resolutions=attn_resolutions, resolution=resolution,
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (x_recon, z, mu, logsigma, kl)."""
+        z, mu, logsigma = self.encoder(x)
+        x_recon = self.decoder(z)
+        # KL(q||p) with logsigma = log(σ): sum over latent dims, mean over batch
+        kl_per_elem = -0.5 * (1 + 2 * logsigma - mu.pow(2) - (2 * logsigma).exp())
+        kl = kl_per_elem.sum(dim=(1, 2, 3)).mean()
         return x_recon, z, mu, logsigma, kl
-    
-    def encode(self, x):
-        """Encode to (mu, logsigma) — no sampling."""
-        mu, logsigma, skips = self.encoder(x, return_z=False)
-        return mu, logsigma, skips
-    
-    def decode(self, z, skips):
-        """Decode from a pre-computed z."""
-        return self.decoder(z, skips)
+
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode to (mu, logsigma) without sampling."""
+        return self.encoder(x, return_z=False)
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+
+
+# ============================================================================
+# Factory functions
+# ============================================================================
+
+def VAE_B(latent_dim=16, resolution=256, **kw):
+    """Base — ch=128, ch_mult=[1,2,4,4], 2 res_blocks, attn@16."""
+    return VAE(latent_dim=latent_dim, ch=128, ch_mult=[1, 2, 4, 4],
+               num_res_blocks=2, attn_resolutions=[16], resolution=resolution, **kw)
+
+def VAE_L(latent_dim=16, resolution=256, **kw):
+    """Large — ch=192, attn@32,16."""
+    return VAE(latent_dim=latent_dim, ch=192, ch_mult=[1, 2, 4, 4],
+               num_res_blocks=2, attn_resolutions=[32, 16], resolution=resolution, **kw)
+
+def VAE_H(latent_dim=16, resolution=256, **kw):
+    """Huge — ch=256, 3 res_blocks, attn@32,16."""
+    return VAE(latent_dim=latent_dim, ch=256, ch_mult=[1, 2, 4, 4],
+               num_res_blocks=3, attn_resolutions=[32, 16], resolution=resolution, **kw)
+
+VAE_models = {'VAE-B': VAE_B, 'VAE-L': VAE_L, 'VAE-H': VAE_H}

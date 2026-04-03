@@ -1,44 +1,73 @@
 model:
   name: "alignment_vae"
-  latent_dim: 768
+  input_size: 256                       # Input image resolution
+  latent_dim: 16                        # Latent channel dim D (spatial: [B, H//16, W//16, D])
   image_channels: 3
-  hidden_dims: [128, 256, 512, 512]
-  use_skip_connections: true
-  
-  # Text encoder config
-  text_encoder_model: "ViT-L/14"       # Open CLIP model
-  text_encoder_pretrained: "openai"    # Pretrained weights source
-  freeze_text_encoder: true            # Keep CLIP frozen during VAE training
-  text_gaussian_hidden: 768            # Hidden dim for μ/σ prediction heads
+
+  # Flux2-style VAE config
+  vae_variant: "VAE-B"                  # VAE-B | VAE-L | VAE-H
+  ch: 128                               # Base channel width (used if vae_variant is custom)
+  ch_mult: [1, 2, 4, 4]                 # Channel multipliers → [128, 256, 512, 512]
+  num_res_blocks: 2                     # ResBlocks per stage (encoder: 2, decoder: 3)
+  attn_resolutions: [16]                # Self-attention at 16x16 resolution
+  double_z: true                        # Encoder outputs 2*D channels for (mu, logsigma)
+
+  # Spatial Label Encoder config
+  label_encoder_variant: "SLE-B"        # SLE-B | SLE-L | SLE-H
+  num_classes: 1000                     # ImageNet classes
+  label_hidden_size: 768                # Transformer hidden dim
+  label_depth: 12                       # Number of AdaLN blocks
+  label_num_heads: 12                   # Attention heads
+  label_mlp_ratio: 4.0
+  label_in_context_len: 32             # In-context label tokens
+  label_in_context_start: 4            # Layer to inject in-context tokens
+  label_init_logsigma: -2.0            # Initial log(σ) for Gaussian heads
 
 training:
+  # Per-GPU batch size. Effective batch = batch_size * num_gpus
   batch_size: 32
   num_workers: 4
   epochs: 100
+
+  # Learning rate (absolute, for VAE branch)
   lr: 1.0e-4
-  lr_text_adapter: 5.0e-5              # Higher LR for newly added Gaussian heads
+  lr_label_encoder: 5.0e-5             # Separate LR for label encoder (scaled via lr_scale)
+  # Alternatively use base_lr: actual_lr = blr * effective_batch / 256
+  # blr: 5.0e-5
+
+  # LR schedule
+  lr_schedule: "cosine"                # cosine | constant
   warmup_epochs: 5
-  
-  # Loss weights
+  min_lr: 0.0
+
+  # Loss weights (KL/alignment/label_ent use sum-over-latent reduction)
   weight_recon: 1.0
-  weight_kl: 1.0e-6
-  weight_alignment: 0.1                # Weight for gaussian alignment loss
-  
-  # Gaussian alignment temperature (for numerical stability)
+  weight_kl: 1e-4                      # VAE KL regularization
+  weight_alignment: 1.2e-4             # Spatial Gaussian alignment (sum reduction, matches prev mean+0.5 strength)
+  weight_label_entropy: 2.5e-6         # Label σ entropy regularization (sum reduction, matches prev mean+0.01)
+
+  # Gaussian alignment temperature
   alignment_temp: 1.0
-  
+
   # Gradient clipping
   grad_clip: 1.0
-  
-  # Logging
-  log_interval: 100
-  eval_interval: 1000
-  save_interval: 10
-  
-  # Dataset (COCO Captions / LAION + captions)
-  dataset: "coco"                      # coco | laion | dummy
-  data_root: "./data"
-  caption_file: "./data/captions.csv"
+
+  # Logging and checkpointing
+  log_interval: 100                    # Print & tensorboard log every N steps
+  save_interval: 10                    # Save checkpoint every N epochs
+
+  # Validation split
+  val_split: 0.1
+  test_split: 0.05
+
+  # Dataset (ImageNet with class labels)
+  dataset: "imagenet"                   # imagenet | dummy
+  data_root: "/mnt/tidalfs-hssh01/dataset/ai_tradesearch/aigc/ILSVRC2012_data"
+  num_classes: 1000
+
+  # Evaluation
+  compute_fid: true                     # Compute FID for label→image generation
+  fid_num_samples: 10000                # Number of samples for FID computation
 
 optimizer:
   type: "adamw"
@@ -48,3 +77,25 @@ optimizer:
 scheduler:
   type: "cosine"
   warmup_type: "linear"
+
+logging:
+  level: "INFO"
+  log_file: "./logs/training.log"
+  use_tensorboard: true
+  tensorboard_dir: "./logs/tensorboard"
+  use_wandb: false
+  wandb_project: "spatial-alignment-vae"
+
+# ============================================================================
+# Distributed training config
+# ============================================================================
+# Launch command examples:
+#
+#   Single GPU:
+#     python train.py --config configs/default.yaml
+#
+#   8 GPUs on one machine, with base LR scaling:
+#     torchrun --nproc_per_node=8 train.py --config configs/default.yaml 
+#
+#   Resume from checkpoint:
+#     torchrun --nproc_per_node=8 train.py --config configs/default.yaml --resume ./output_dir
