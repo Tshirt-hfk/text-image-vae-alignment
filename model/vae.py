@@ -42,7 +42,8 @@ class ResBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    """Single-head self-attention on spatial feature maps."""
+    """Single-head self-attention on spatial feature maps.
+    Uses F.scaled_dot_product_attention for FlashAttention / memory-efficient backends."""
 
     def __init__(self, in_channels: int):
         super().__init__()
@@ -58,13 +59,14 @@ class AttnBlock(nn.Module):
         q, k, v = self.q(h), self.k(h), self.v(h)
         B, C, H, W = q.shape
 
-        q = q.reshape(B, C, H * W)
-        k = k.reshape(B, C, H * W)
-        v = v.reshape(B, C, H * W)
+        # Reshape to [B, 1, H*W, C] for SDPA (single head)
+        q = q.reshape(B, C, H * W).permute(0, 2, 1).unsqueeze(1)  # [B, 1, N, C]
+        k = k.reshape(B, C, H * W).permute(0, 2, 1).unsqueeze(1)
+        v = v.reshape(B, C, H * W).permute(0, 2, 1).unsqueeze(1)
 
-        attn = torch.bmm(q.permute(0, 2, 1), k) * (C ** -0.5)
-        attn = F.softmax(attn, dim=-1)
-        h = torch.bmm(v, attn.permute(0, 2, 1)).reshape(B, C, H, W)
+        # Use PyTorch's optimized SDPA (auto-selects FlashAttention / xformers / math)
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.squeeze(1).permute(0, 2, 1).reshape(B, C, H, W)
         return x + self.proj_out(h)
 
 

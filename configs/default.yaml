@@ -1,7 +1,7 @@
 model:
   name: "alignment_vae"
   input_size: 256                       # Input image resolution
-  latent_dim: 16                        # Latent channel dim D (spatial: [B, H//16, W//16, D])
+  latent_dim: 64                        # Latent channel dim D (spatial: [B, H//16, W//16, D])
   image_channels: 3
 
   # Flux2-style VAE config
@@ -32,30 +32,27 @@ training:
 
   # Learning rate (absolute, for VAE branch)
   lr: 1.0e-4
-  lr_label_encoder: 5.0e-5              # Separate LR for label encoder (scaled via lr_scale)
-  # Alternatively use base_lr: actual_lr = blr * effective_batch / 256
-  # blr: 5.0e-5
+  lr_label_encoder: 1.0e-4              # Separate LR for label encoder (scaled via lr_scale)
 
   # LR schedule
-  lr_schedule: "cosine"                 # cosine | constant
+  lr_schedule: "constant"                 # cosine | constant
   warmup_epochs: 5
   min_lr: 0.0
 
-  # Loss weights (KL/alignment/label_ent use sum-over-latent reduction)
+  # Loss weights (alignment uses mean reduction)
   weight_recon: 1.0
-  weight_kl: 5e-5                       # VAE KL regularization (β_eff ≈ 0.2 with sum reduction over 4096 latent elements)
-  weight_alignment: 1.2e-4              # Spatial Gaussian alignment (sum reduction, matches prev mean+0.5 strength)
-  weight_label_entropy: 2.5e-6          # Label σ entropy regularization (sum reduction, matches prev mean+0.01)
+  weight_alignment: 2.0                 # KL(q_img || q_label) — forward alignment (diversity-preserving)
+  weight_alignment_reverse: 0.5         # KL(q_label || q_img) — stabilize μ alignment, prevent σ overshoot
 
   # Gaussian alignment temperature
   alignment_temp: 1.0
 
-  # KL Annealing: gradually ramp up KL weight from 0 → 1 to prevent posterior collapse
-  kl_anneal_strategy: "linear"          # linear | cosine | constant (no annealing)
-  kl_anneal_epochs: 10                  # epochs to fully ramp up KL weight (0 = disabled)
-
   # Gradient clipping
   grad_clip: 1.0
+
+  # Performance optimization
+  use_amp: true                          # AMP mixed-precision training (fp16)
+  use_compile: false                     # torch.compile (PyTorch 2.0+, set true to enable kernel fusion)
 
   # Logging and checkpointing
   log_interval: 100                     # Print & tensorboard log every N steps

@@ -18,15 +18,21 @@ import numpy as np
 import os
 import sys
 import time
+import warnings
 import yaml
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+# Suppress DDP stride-mismatch warning for 1x1 Conv weights (cuDNN backward
+# produces channels_last grads; harmless for H=W=1 since memory layout is identical)
+warnings.filterwarnings("ignore", message="Grad strides do not match bucket view strides")
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms, datasets
@@ -37,37 +43,6 @@ from model.vae import VAE, VAE_models
 
 import util.misc as misc
 import util.lr_sched as lr_sched
-
-
-def get_kl_anneal_factor(epoch: float, args) -> float:
-    """Compute KL annealing factor (0 → 1) based on current epoch.
-
-    Supports three strategies:
-        - "linear":  linearly ramp from 0 to 1 over [0, kl_anneal_epochs)
-        - "cosine":  cosine ramp (slow start, fast middle, slow end)
-        - "constant": no annealing, always 1.0
-
-    Args:
-        epoch: current fractional epoch (e.g. 3.5 = halfway through epoch 4)
-        args: must have .kl_anneal_strategy and .kl_anneal_epochs
-
-    Returns:
-        factor in [0, 1]
-    """
-    strategy = getattr(args, 'kl_anneal_strategy', 'linear')
-    anneal_epochs = getattr(args, 'kl_anneal_epochs', 0)
-
-    if strategy == 'constant' or anneal_epochs <= 0:
-        return 1.0
-
-    progress = min(epoch / anneal_epochs, 1.0)
-
-    if strategy == 'linear':
-        return progress
-    elif strategy == 'cosine':
-        return 0.5 * (1.0 - math.cos(math.pi * progress))
-    else:
-        return 1.0
 
 
 # ============================================================================
@@ -104,17 +79,19 @@ def get_args_parser():
     parser.add_argument('--weight_decay', type=float, default=None)
     parser.add_argument('--grad_clip', type=float, default=None)
 
-    # KL annealing
-    parser.add_argument('--kl_anneal_strategy', type=str, default=None,
-                        help='KL annealing strategy: linear | cosine | constant')
-    parser.add_argument('--kl_anneal_epochs', type=float, default=None,
-                        help='Number of epochs to anneal KL weight from 0 to 1')
-
     # dataset
     parser.add_argument('--data_path', type=str, default=None)
     parser.add_argument('--num_workers', type=int, default=None)
     parser.add_argument('--pin_mem', action='store_true', default=True)
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
+
+    # performance
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Enable AMP (automatic mixed precision) training')
+    parser.add_argument('--no_amp', action='store_false', dest='use_amp',
+                        help='Disable AMP training')
+    parser.add_argument('--use_compile', action='store_true', default=False,
+                        help='Enable torch.compile for model optimization (PyTorch 2.0+)')
 
     # misc
     parser.add_argument('--seed', type=int, default=0)
@@ -180,16 +157,9 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
 
     # Loss weights (explicit float() to guard against YAML parsing '1e-4' as str)
     args.weight_recon = float(train_cfg.get('weight_recon', 1.0))
-    args.weight_kl = float(train_cfg.get('weight_kl', 1e-4))
     args.weight_alignment = float(train_cfg.get('weight_alignment', 0.1))
-    args.weight_label_entropy = float(train_cfg.get('weight_label_entropy', 0.01))
+    args.weight_alignment_reverse = float(train_cfg.get('weight_alignment_reverse', 0.0))
     args.alignment_temp = float(train_cfg.get('alignment_temp', 1.0))
-
-    # KL annealing
-    args.kl_anneal_strategy = (args.kl_anneal_strategy
-                               or train_cfg.get('kl_anneal_strategy', 'linear'))
-    args.kl_anneal_epochs = (args.kl_anneal_epochs if args.kl_anneal_epochs is not None
-                             else float(train_cfg.get('kl_anneal_epochs', 10)))
 
     # Dataset
     args.data_path = args.data_path or train_cfg.get('data_root', './data/imagenet')
@@ -208,6 +178,12 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     # Evaluation
     args.compute_fid = train_cfg.get('compute_fid', False)
     args.fid_num_samples = train_cfg.get('fid_num_samples', 10000)
+
+    # Performance (CLI flags override YAML)
+    if not hasattr(args, 'use_amp') or args.use_amp is True:
+        args.use_amp = train_cfg.get('use_amp', True)
+    if not hasattr(args, 'use_compile') or args.use_compile is False:
+        args.use_compile = train_cfg.get('use_compile', False)
 
     args.yaml_config = cfg
     return args
@@ -423,9 +399,8 @@ def build_model(args) -> AlignmentVAE:
         vae=vae,
         label_encoder=label_encoder,
         weight_recon=args.weight_recon,
-        weight_kl=args.weight_kl,
         weight_alignment=args.weight_alignment,
-        weight_label_entropy=args.weight_label_entropy,
+        weight_alignment_reverse=args.weight_alignment_reverse,
     )
 
     # Print summary
@@ -463,17 +438,22 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     epoch: int,
+    scaler: Optional[GradScaler] = None,
     log_writer=None,
     args=None,
 ):
-    """Train for one epoch with per-iteration LR scheduling and gradient accumulation."""
+    """Train for one epoch with AMP, per-iteration LR scheduling and gradient accumulation."""
     model.train()
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = f'[Epoch {epoch + 1}/{args.epochs}]'
     print_freq = args.log_freq
     accum_iter = getattr(args, 'accum_iter', 1)
+    use_amp = getattr(args, 'use_amp', True) and device.type == 'cuda'
 
+    # Use set_to_none=False with gradient_as_bucket_view=True:
+    # DDP bucket views serve as .grad storage, zero_grad() clears them in-place,
+    # backward accumulates directly into buckets — avoids cuDNN channels_last stride mismatch.
     optimizer.zero_grad()
 
     for step, (images, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
@@ -482,60 +462,67 @@ def train_one_epoch(
             fractional_epoch = step / len(data_loader) + epoch
             lr_sched.adjust_learning_rate(optimizer, fractional_epoch, args)
 
-        # KL annealing: ramp KL weight from 0 → 1 over kl_anneal_epochs
-        fractional_epoch = step / len(data_loader) + epoch
-        kl_anneal_factor = get_kl_anneal_factor(fractional_epoch, args)
-
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         # Use no_sync context for non-update steps in DDP to avoid redundant all-reduce
         if accum_iter > 1 and hasattr(model, 'no_sync'):
-            ctx = model.no_sync if (step + 1) % accum_iter != 0 else nullcontext
+            sync_ctx = model.no_sync if (step + 1) % accum_iter != 0 else nullcontext
         else:
-            ctx = nullcontext
+            sync_ctx = nullcontext
 
-        with ctx():
-            x_recon, loss, metrics = model(images, labels, kl_anneal_factor=kl_anneal_factor)
-            loss = loss / accum_iter  # Normalize loss by accumulation steps
+        with sync_ctx():
+            with autocast('cuda', enabled=use_amp):
+                x_recon, loss, metrics = model(images, labels)
+                loss = loss / accum_iter  # Normalize loss by accumulation steps
 
         loss_value = loss.item() * accum_iter  # Un-scale for logging (show true per-sample loss)
         if not math.isfinite(loss_value):
             print(f"Loss is {loss_value}, stopping training", flush=True)
             sys.exit(1)
 
-        loss.backward()
+        # AMP-aware backward pass
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # Optimizer step at the end of each accumulation window
         if (step + 1) % accum_iter == 0:
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
+            if scaler is not None:
+                if args.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
             optimizer.zero_grad()
 
-        torch.cuda.synchronize()
-
+        # Update local metrics (removed torch.cuda.synchronize() — unnecessary bottleneck)
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_recon=metrics.get('loss_recon', 0))
         metric_logger.update(loss_align=metrics.get('loss_alignment', 0))
-        metric_logger.update(loss_kl=metrics.get('loss_kl_vae', 0))
-        metric_logger.update(loss_label_ent=metrics.get('loss_label_entropy', 0))
+        metric_logger.update(loss_align_rev=metrics.get('loss_kl_reverse', 0))
+        metric_logger.update(sigma_img=metrics.get('mean_sigma_img', 0))
+        metric_logger.update(sigma_lbl=metrics.get('mean_sigma_label', 0))
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
-        metric_logger.update(kl_anneal=kl_anneal_factor)
 
-        loss_value_reduce = misc.all_reduce_mean(loss_value)
-
-        if log_writer is not None and step % args.log_freq == 0:
-            epoch_1000x = int((step / len(data_loader) + epoch) * 1000)
-            log_writer.add_scalar('train/loss', loss_value_reduce, epoch_1000x)
-            log_writer.add_scalar('train/loss_recon', metrics.get('loss_recon', 0), epoch_1000x)
-            log_writer.add_scalar('train/loss_alignment', metrics.get('loss_alignment', 0), epoch_1000x)
-            log_writer.add_scalar('train/loss_kl_vae', metrics.get('loss_kl_vae', 0), epoch_1000x)
-            log_writer.add_scalar('train/loss_label_entropy', metrics.get('loss_label_entropy', 0), epoch_1000x)
-            log_writer.add_scalar('train/mean_sigma_label', metrics.get('mean_sigma_label', 0), epoch_1000x)
-            log_writer.add_scalar('train/kl_anneal_factor', kl_anneal_factor, epoch_1000x)
-            log_writer.add_scalar('train/lr', lr, epoch_1000x)
+        # all_reduce must be called by ALL ranks (collective op), but only log on rank 0
+        if step % args.log_freq == 0:
+            loss_value_reduce = misc.all_reduce_mean(loss_value)
+            if log_writer is not None:
+                epoch_1000x = int((step / len(data_loader) + epoch) * 1000)
+                log_writer.add_scalar('train/loss', loss_value_reduce, epoch_1000x)
+                log_writer.add_scalar('train/loss_recon', metrics.get('loss_recon', 0), epoch_1000x)
+                log_writer.add_scalar('train/loss_alignment', metrics.get('loss_alignment', 0), epoch_1000x)
+                log_writer.add_scalar('train/loss_kl_reverse', metrics.get('loss_kl_reverse', 0), epoch_1000x)
+                log_writer.add_scalar('train/mean_sigma_label', metrics.get('mean_sigma_label', 0), epoch_1000x)
+                log_writer.add_scalar('train/mean_sigma_img', metrics.get('mean_sigma_img', 0), epoch_1000x)
+                log_writer.add_scalar('train/lr', lr, epoch_1000x)
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -551,10 +538,12 @@ def evaluate(
     compute_fid: bool = False,
     fid_num_samples: int = 10000,
     header: str = "Val:",
+    use_amp: bool = True,
 ):
     """Evaluate: loss, MSE, PSNR, SSIM, recon/gen FID."""
     model.eval()
     metric_logger = misc.MetricLogger(delimiter="  ")
+    use_amp = use_amp and device.type == 'cuda'
 
     feats_real_list, feats_recon_list, feats_gen_list = [], [], []
     fid_samples_collected = 0
@@ -565,13 +554,18 @@ def evaluate(
         images = images.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        x_recon, loss, metrics = model(images, labels)
+        with autocast('cuda', enabled=use_amp):
+            x_recon, loss, metrics = model(images, labels)
+
+        # Cast back to float32 for metric computation
+        x_recon = x_recon.float()
 
         metric_logger.update(loss=loss.item())
         metric_logger.update(loss_recon=metrics.get('loss_recon', 0))
         metric_logger.update(loss_align=metrics.get('loss_alignment', 0))
-        metric_logger.update(loss_kl=metrics.get('loss_kl_vae', 0))
-        metric_logger.update(loss_label_ent=metrics.get('loss_label_entropy', 0))
+        metric_logger.update(loss_align_rev=metrics.get('loss_kl_reverse', 0))
+        metric_logger.update(sigma_img=metrics.get('mean_sigma_img', 0))
+        metric_logger.update(sigma_lbl=metrics.get('mean_sigma_label', 0))
 
         metric_logger.update(mse=metrics_computer.compute_mse(images, x_recon))
         metric_logger.update(psnr=metrics_computer.compute_psnr(images, x_recon))
@@ -681,13 +675,10 @@ def _print_config(args):
 
     _section("Loss Weights", [
         ("recon",               str(args.weight_recon)),
-        ("kl",                  str(args.weight_kl)),
-        ("alignment",           str(args.weight_alignment)),
-        ("label_entropy",       str(args.weight_label_entropy)),
+        ("alignment (fwd)",     str(args.weight_alignment)),
+        ("alignment (rev)",     str(args.weight_alignment_reverse)),
         ("alignment_temp",      str(args.alignment_temp)),
         ("label_init_logsigma", str(args.label_init_logsigma)),
-        ("kl_anneal_strategy",  str(args.kl_anneal_strategy)),
-        ("kl_anneal_epochs",    str(args.kl_anneal_epochs)),
     ])
 
     _section("Data", [
@@ -696,10 +687,12 @@ def _print_config(args):
         ("num_workers",         str(args.num_workers)),
     ])
 
-    _section("Distributed", [
+    _section("Distributed & Performance", [
         ("world_size",          str(getattr(args, 'world_size', 1))),
         ("distributed",         str(getattr(args, 'distributed', False))),
         ("device",              str(args.device)),
+        ("use_amp",             str(getattr(args, 'use_amp', True))),
+        ("use_compile",         str(getattr(args, 'use_compile', False))),
     ])
 
     _section("Checkpoint", [
@@ -726,6 +719,10 @@ def main(args):
     torch.manual_seed(seed)
     np.random.seed(seed)
     cudnn.benchmark = True
+
+    # AMP / torch.compile flags
+    use_amp = getattr(args, 'use_amp', True) and device.type == 'cuda'
+    use_compile = getattr(args, 'use_compile', False)
 
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -791,6 +788,8 @@ def main(args):
 
     loader_kwargs = dict(
         batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_mem,
+        persistent_workers=args.num_workers > 0,  # Keep worker processes alive between epochs
+        prefetch_factor=4 if args.num_workers > 0 else None,  # Pre-fetch more batches
     )
     data_loader_train = DataLoader(train_dataset, sampler=sampler_train, drop_last=True, **loader_kwargs)
     data_loader_val = DataLoader(val_dataset, sampler=sampler_val, drop_last=False, **loader_kwargs)
@@ -799,19 +798,40 @@ def main(args):
     model = build_model(args)
     model.to(device)
 
+    # torch.compile for kernel fusion & graph optimization (PyTorch 2.0+)
+    if use_compile:
+        print("Compiling model with torch.compile (mode='reduce-overhead')...")
+        model = torch.compile(model, mode='reduce-overhead')
+
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=False)
+            model, device_ids=[args.gpu], find_unused_parameters=False,
+            gradient_as_bucket_view=True)  # Reuse comm buffer as grad storage
         model_without_ddp = model.module
     else:
         model_without_ddp = model
 
-    # Optimizer (separate LR for label encoder)
+    # Optimizer (separate LR for label encoder; fused=True for CUDA-accelerated AdamW)
+    try:
+        import inspect
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+    except Exception:
+        fused_available = False
+    use_fused = fused_available and device.type == 'cuda'
+    extra_optim_kwargs = {'fused': True} if use_fused else {}
     optimizer = torch.optim.AdamW([
         {'params': model_without_ddp.vae.parameters(), 'lr': args.lr},
         {'params': model_without_ddp.label_encoder.parameters(),
          'lr': args.lr, 'lr_scale': lr_scale_label},
-    ], weight_decay=args.weight_decay, betas=(0.9, 0.999))
+    ], weight_decay=args.weight_decay, betas=(0.9, 0.999),
+       **extra_optim_kwargs)
+    if use_fused:
+        print("Using fused AdamW optimizer (CUDA-accelerated)")
+
+    # AMP GradScaler
+    scaler = GradScaler('cuda', enabled=use_amp) if use_amp else None
+    if use_amp:
+        print("Using AMP (automatic mixed precision) training")
 
     # Metrics
     metrics_computer = MetricsComputer(
@@ -832,6 +852,9 @@ def main(args):
                 optimizer.load_state_dict(ckpt['optimizer'])
                 args.start_epoch = ckpt['epoch'] + 1
                 print(f"Resumed optimizer & epoch (start_epoch={args.start_epoch})")
+            if scaler is not None and 'scaler' in ckpt:
+                scaler.load_state_dict(ckpt['scaler'])
+                print("Resumed AMP scaler state")
             del ckpt
         else:
             print(f"[WARN] Checkpoint not found: {ckpt_path}. Training from scratch.")
@@ -851,6 +874,7 @@ def main(args):
             optimizer=optimizer,
             device=device,
             epoch=epoch,
+            scaler=scaler,
             log_writer=log_writer,
             args=args,
         )
@@ -860,6 +884,7 @@ def main(args):
             compute_fid=args.compute_fid,
             fid_num_samples=args.fid_num_samples,
             header="Val:",
+            use_amp=use_amp,
         )
 
         # TensorBoard logging
@@ -874,11 +899,12 @@ def main(args):
             misc.save_model(
                 args=args, model_without_ddp=model_without_ddp,
                 optimizer=optimizer, epoch=epoch, epoch_name="last",
+                scaler=scaler,
             )
         if epoch > 0 and epoch % 50 == 0:
             misc.save_model(
                 args=args, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, epoch=epoch,
+                optimizer=optimizer, epoch=epoch, scaler=scaler,
             )
 
         val_loss = val_stats.get('loss', float('inf'))
@@ -887,6 +913,7 @@ def main(args):
             misc.save_model(
                 args=args, model_without_ddp=model_without_ddp,
                 optimizer=optimizer, epoch=epoch, epoch_name="best",
+                scaler=scaler,
             )
             print(f"New best model saved (val_loss={best_val_loss:.4f})")
 

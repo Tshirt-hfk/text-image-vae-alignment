@@ -243,9 +243,10 @@ def init_distributed_mode(args):
         backend=args.dist_backend,
         init_method=args.dist_url,
         world_size=args.world_size,
-        rank=args.rank
+        rank=args.rank,
+        device_id=torch.device(f"cuda:{args.gpu}"),
     )
-    torch.distributed.barrier()
+    torch.distributed.barrier(device_ids=[args.gpu])
     setup_for_distributed(args.rank == 0)
 
 
@@ -278,7 +279,7 @@ def add_weight_decay(model, weight_decay=0, skip_list=()):
     ]
 
 
-def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
+def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None, scaler=None):
     """Save model checkpoint (only on main process)."""
     if epoch_name is None:
         epoch_name = str(epoch)
@@ -291,4 +292,6 @@ def save_model(args, model_without_ddp, optimizer, epoch, epoch_name=None):
         'epoch': epoch,
         'args': args,
     }
+    if scaler is not None:
+        to_save['scaler'] = scaler.state_dict()
     save_on_master(to_save, checkpoint_path)

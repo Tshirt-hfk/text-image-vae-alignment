@@ -5,7 +5,7 @@ KL(N(μ1,σ1²) || N(μ2,σ2²)) closed form (diagonal Gaussian):
     = Σ_d [ log(σ2_d/σ1_d) + (σ1_d² + (μ1_d-μ2_d)²) / (2σ2_d²) - 0.5 ]
 
 Both image and label are encoded as [B, h, w, D] spatial Gaussians.
-KL is computed per element, summed over latent dims (h, w, D), and averaged over batch.
+KL is computed per element and averaged over all dims (batch + latent).
 """
 
 import torch
@@ -30,17 +30,13 @@ class GaussianAlignmentLoss(nn.Module):
         mu1: torch.Tensor, logsigma1: torch.Tensor,
         mu2: torch.Tensor, logsigma2: torch.Tensor,
     ) -> torch.Tensor:
-        """KL(N(μ1,σ1²) || N(μ2,σ2²)), sum over latent dims, mean over batch."""
+        """KL(N(μ1,σ1²) || N(μ2,σ2²)), mean over all dims (latent + batch)."""
         sigma1 = torch.exp(torch.clamp(logsigma1, min=-5, max=5))
         sigma2 = torch.exp(torch.clamp(logsigma2, min=-5, max=5))
         log_ratio = logsigma2 - logsigma1
         var_term = (sigma1 ** 2 + (mu1 - mu2) ** 2) / (2 * sigma2 ** 2 + 1e-8)
         kl_per_elem = log_ratio + var_term - 0.5
-        # sum over latent dims, mean over batch; supports [B, h, w, D] or [B, D]
-        if kl_per_elem.dim() == 4:
-            return kl_per_elem.sum(dim=(1, 2, 3)).mean()
-        else:
-            return kl_per_elem.sum(dim=1).mean()
+        return kl_per_elem.mean()
 
     def forward(
         self,

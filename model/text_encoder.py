@@ -61,13 +61,11 @@ class Attention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
         q, k = rope(q), rope(k)
 
-        scale = 1 / math.sqrt(q.size(-1))
-        with torch.amp.autocast('cuda', enabled=False):
-            attn = q.float() @ k.float().transpose(-2, -1) * scale
-        attn = torch.softmax(attn, dim=-1)
-        attn = torch.dropout(attn, self.attn_drop.p if self.training else 0., train=self.training)
+        # Use PyTorch SDPA (auto-selects FlashAttention / xformers / math backend)
+        drop_p = self.attn_drop.p if self.training else 0.0
+        x = F.scaled_dot_product_attention(q, k, v, dropout_p=drop_p)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = x.transpose(1, 2).reshape(B, N, C)
         return self.proj_drop(self.proj(x))
 
 
@@ -97,16 +95,13 @@ class AdaLNBlock(nn.Module):
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         self.mlp = SwiGLUFFN(hidden_size, int(hidden_size * mlp_ratio), drop=proj_drop)
         self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+            nn.SiLU(), nn.Linear(hidden_size, 4 * hidden_size, bias=True),
         )
 
     def forward(self, x, c, feat_rope=None):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = \
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(
-            modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(
-            modulate(self.norm2(x), shift_mlp, scale_mlp))
+        shift_msa, scale_msa, shift_mlp, scale_mlp = self.adaLN_modulation(c).chunk(4, dim=-1)
+        x = x + self.attn(modulate(self.norm1(x), shift_msa, scale_msa), rope=feat_rope)
+        x = x + self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
 
@@ -238,24 +233,24 @@ class SpatialLabelEncoder(nn.Module):
 # ============================================================================
 
 def SpatialLabelEncoder_B(input_size=256, num_classes=1000, latent_dim=16, **kw):
-    """Base — 12 layers, 768 hidden, 12 heads."""
+    """Base — 6 layers, 768 hidden, 12 heads."""
     return SpatialLabelEncoder(
         input_size=input_size, patch_size=16, num_classes=num_classes,
-        hidden_size=768, latent_dim=latent_dim, depth=12, num_heads=12,
+        hidden_size=768, latent_dim=latent_dim, depth=6, num_heads=12,
         in_context_len=32, in_context_start=4, **kw)
 
 def SpatialLabelEncoder_L(input_size=256, num_classes=1000, latent_dim=16, **kw):
-    """Large — 24 layers, 1024 hidden, 16 heads."""
+    """Large — 12 layers, 1024 hidden, 16 heads."""
     return SpatialLabelEncoder(
         input_size=input_size, patch_size=16, num_classes=num_classes,
-        hidden_size=1024, latent_dim=latent_dim, depth=24, num_heads=16,
+        hidden_size=1024, latent_dim=latent_dim, depth=12, num_heads=16,
         in_context_len=32, in_context_start=8, **kw)
 
 def SpatialLabelEncoder_H(input_size=256, num_classes=1000, latent_dim=16, **kw):
-    """Huge — 32 layers, 1280 hidden, 16 heads."""
+    """Huge — 16 layers, 1280 hidden, 16 heads."""
     return SpatialLabelEncoder(
         input_size=input_size, patch_size=16, num_classes=num_classes,
-        hidden_size=1280, latent_dim=latent_dim, depth=32, num_heads=16,
+        hidden_size=1280, latent_dim=latent_dim, depth=16, num_heads=16,
         in_context_len=32, in_context_start=10, **kw)
 
 SpatialLabelEncoder_models = {
