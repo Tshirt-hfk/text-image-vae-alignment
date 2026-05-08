@@ -58,13 +58,10 @@ training:
   log_interval: 100                     # Print & tensorboard log every N steps
   save_interval: 10                     # Save checkpoint every N epochs
 
-  # Validation split
-  val_split: 0.1
-  test_split: 0.05
-
   # Dataset (ImageNet with class labels)
+  # Expected layout: data_root/{train, val}/<class_name>/*.jpg
   dataset: "imagenet"                   # imagenet | dummy
-  data_root: "/mnt/tidalfs-hssh01/dataset/ai_tradesearch/aigc/ILSVRC2012_data"
+  data_root: "/mnt/tidalfs-bdsz01/dataset/aigc-data/data/imagenet"
   num_classes: 1000
 
   # Evaluation

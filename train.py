@@ -33,7 +33,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms, datasets
 
@@ -163,8 +163,6 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
 
     # Dataset
     args.data_path = args.data_path or train_cfg.get('data_root', './data/imagenet')
-    args.val_split = train_cfg.get('val_split', 0.1)
-    args.test_split = train_cfg.get('test_split', 0.05)
 
     # Workers / logging
     args.num_workers = (args.num_workers if args.num_workers is not None
@@ -683,7 +681,6 @@ def _print_config(args):
 
     _section("Data", [
         ("data_path",           str(args.data_path)),
-        ("val_split",           str(args.val_split)),
         ("num_workers",         str(args.num_workers)),
     ])
 
@@ -759,21 +756,16 @@ def main(args):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    full_dataset = ImageLabelDataset(
+    train_dataset = ImageLabelDataset(
         root=args.data_path, split="train",
         transform=transform_train, num_classes=args.num_classes,
     )
-
-    total_len = len(full_dataset)
-    val_len = int(total_len * args.val_split)
-    train_len = total_len - val_len
-
-    train_dataset, val_dataset = random_split(
-        full_dataset, [train_len, val_len],
-        generator=torch.Generator().manual_seed(42),
+    val_dataset = ImageLabelDataset(
+        root=args.data_path, split="val",
+        transform=transform_val, num_classes=args.num_classes,
     )
 
-    print(f"Dataset: train={train_len}, val={val_len}")
+    print(f"Dataset: train={len(train_dataset)}, val={len(val_dataset)}")
 
     # Samplers
     if args.distributed:
