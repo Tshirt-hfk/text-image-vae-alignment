@@ -38,7 +38,10 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms, datasets
 
 from model import AlignmentVAE
-from model.text_encoder import SpatialLabelEncoder, SpatialLabelEncoder_models
+from model.text_encoder import (
+    SpatialLabelEncoder, SpatialLabelEncoder_models,
+    EmbeddingLabelEncoder,
+)
 from model.vae import VAE, VAE_models
 
 import util.misc as misc
@@ -136,6 +139,12 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.attn_resolutions = model_cfg.get('attn_resolutions', [16])
     args.double_z = model_cfg.get('double_z', True)
     args.label_init_logsigma = model_cfg.get('label_init_logsigma', -2.0)
+    # 新增：是否绕过 Transformer，直接用 nn.Embedding 把 label 映射到高斯参数。
+    # 该开关优先级高于 label_encoder_variant —— 一旦开启，无论指定何种变体，
+    # 标签编码器一律构建为 EmbeddingLabelEncoder（用于消融 / 快速 baseline）。
+    args.use_embedding_label_encoder = bool(
+        model_cfg.get('use_embedding_label_encoder', False)
+    )
 
     # Training
     args.epochs = args.epochs or train_cfg.get('epochs', 100)
@@ -368,25 +377,35 @@ def build_model(args) -> AlignmentVAE:
         )
 
     # Label encoder
-    sle_variant = args.label_encoder_variant
-    if sle_variant in SpatialLabelEncoder_models:
-        label_encoder = SpatialLabelEncoder_models[sle_variant](
-            input_size=args.input_size, num_classes=args.num_classes,
-            latent_dim=args.latent_dim, init_logsigma=args.label_init_logsigma,
-        )
-    else:
-        model_cfg = args.yaml_config.get('model', {})
-        label_encoder = SpatialLabelEncoder(
+    # 当 use_embedding_label_encoder 开启时：跳过 Transformer 构建，
+    # 直接使用 EmbeddingLabelEncoder（label → nn.Embedding → 高斯参数）。
+    if getattr(args, 'use_embedding_label_encoder', False):
+        sle_variant = 'SLE-E (embed)'
+        label_encoder = EmbeddingLabelEncoder(
             input_size=args.input_size, patch_size=16,
             num_classes=args.num_classes, latent_dim=args.latent_dim,
-            hidden_size=model_cfg.get('label_hidden_size', 768),
-            depth=model_cfg.get('label_depth', 12),
-            num_heads=model_cfg.get('label_num_heads', 12),
-            mlp_ratio=model_cfg.get('label_mlp_ratio', 4.0),
-            in_context_len=model_cfg.get('label_in_context_len', 32),
-            in_context_start=model_cfg.get('label_in_context_start', 4),
             init_logsigma=args.label_init_logsigma,
         )
+    else:
+        sle_variant = args.label_encoder_variant
+        if sle_variant in SpatialLabelEncoder_models:
+            label_encoder = SpatialLabelEncoder_models[sle_variant](
+                input_size=args.input_size, num_classes=args.num_classes,
+                latent_dim=args.latent_dim, init_logsigma=args.label_init_logsigma,
+            )
+        else:
+            model_cfg = args.yaml_config.get('model', {})
+            label_encoder = SpatialLabelEncoder(
+                input_size=args.input_size, patch_size=16,
+                num_classes=args.num_classes, latent_dim=args.latent_dim,
+                hidden_size=model_cfg.get('label_hidden_size', 768),
+                depth=model_cfg.get('label_depth', 12),
+                num_heads=model_cfg.get('label_num_heads', 12),
+                mlp_ratio=model_cfg.get('label_mlp_ratio', 4.0),
+                in_context_len=model_cfg.get('label_in_context_len', 32),
+                in_context_start=model_cfg.get('label_in_context_start', 4),
+                init_logsigma=args.label_init_logsigma,
+            )
 
     # Assemble
     model = AlignmentVAE(
@@ -648,9 +667,12 @@ def _print_config(args):
     print("  Configuration")
     print(sep)
 
+    use_embed = getattr(args, 'use_embedding_label_encoder', False)
     _section("Model", [
         ("vae_variant",           str(getattr(args, 'vae_variant', 'VAE-B'))),
-        ("label_encoder_variant", str(getattr(args, 'label_encoder_variant', 'SLE-B'))),
+        ("label_encoder_variant", str(getattr(args, 'label_encoder_variant', 'SLE-B'))
+                                  + ("  (overridden by embedding-only)" if use_embed else "")),
+        ("use_embedding_label_encoder", str(use_embed)),
         ("input_size",            str(args.input_size)),
         ("latent_dim",            str(args.latent_dim)),
         ("image_channels",        str(args.image_channels)),

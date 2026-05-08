@@ -229,6 +229,68 @@ class SpatialLabelEncoder(nn.Module):
 
 
 # ============================================================================
+# Embedding-only Label Encoder (Transformer-free baseline)
+# ============================================================================
+
+class EmbeddingLabelEncoder(nn.Module):
+    """
+    轻量级标签编码器：跳过 Transformer，直接用 nn.Embedding 把 label 映射到
+    每个空间位置的高斯分布参数 (μ, logσ)。
+
+    label (int)
+        ├── mu_table   [num_classes, h*w*latent_dim]  → reshape → [B, h, w, D]
+        └── logsigma_table  同上
+
+    适用场景：
+      - 与基于 Transformer 的 SpatialLabelEncoder 做消融对比
+      - 数据量小或 num_classes 少时的更快 baseline
+      - 验证"对齐 KL"是否真的需要表达力强的标签编码器
+    """
+
+    def __init__(self, input_size: int = 256, patch_size: int = 16,
+                 num_classes: int = 1000, latent_dim: int = 16,
+                 init_logsigma: float = -2.0):
+        super().__init__()
+
+        self.hw = input_size // patch_size
+        self.num_patches = self.hw * self.hw
+        self.latent_dim = latent_dim
+        self.num_classes = num_classes
+
+        per_label_dim = self.num_patches * latent_dim
+
+        # 两个独立 Embedding 表分别保存 μ 和 logσ
+        self.mu_table = nn.Embedding(num_classes + 1, per_label_dim)
+        self.logsigma_table = nn.Embedding(num_classes + 1, per_label_dim)
+
+        # 初始化：μ ≈ 0、logσ ≈ init_logsigma，与 SpatialLabelEncoder 的初始
+        # 输出（mu_head 全零、logsigma_head bias=init_logsigma）保持一致，
+        # 保证两种编码器在训练初期具有相近的起点。
+        nn.init.normal_(self.mu_table.weight, std=0.02)
+        nn.init.constant_(self.logsigma_table.weight, init_logsigma)
+
+    def forward(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            labels: [B] integer class labels
+        Returns:
+            mu, logsigma: [B, h, w, latent_dim]
+        """
+        B = labels.shape[0]
+        h = w = self.hw
+        D = self.latent_dim
+
+        mu = self.mu_table(labels).reshape(B, h, w, D)
+        logsigma = self.logsigma_table(labels).reshape(B, h, w, D)
+        logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
+        return mu, logsigma
+
+    def sample(self, mu: torch.Tensor, logsigma: torch.Tensor) -> torch.Tensor:
+        """Reparameterization: z = μ + σ·ε."""
+        return mu + torch.exp(logsigma) * torch.randn_like(mu)
+
+
+# ============================================================================
 # Factory functions
 # ============================================================================
 
@@ -253,8 +315,20 @@ def SpatialLabelEncoder_H(input_size=256, num_classes=1000, latent_dim=16, **kw)
         hidden_size=1280, latent_dim=latent_dim, depth=16, num_heads=16,
         in_context_len=32, in_context_start=10, **kw)
 
+
+def EmbeddingLabelEncoder_E(input_size=256, num_classes=1000, latent_dim=16, **kw):
+    """Embedding-only baseline — 无 Transformer，直接查表得高斯参数。"""
+    # 只接受 EmbeddingLabelEncoder 真正用到的 kwargs，过滤掉 build_model
+    # 透传过来的 hidden_size/depth/num_heads 等 Transformer 专属参数。
+    accepted = {k: v for k, v in kw.items() if k in ('init_logsigma',)}
+    return EmbeddingLabelEncoder(
+        input_size=input_size, patch_size=16, num_classes=num_classes,
+        latent_dim=latent_dim, **accepted)
+
+
 SpatialLabelEncoder_models = {
     'SLE-B': SpatialLabelEncoder_B,
     'SLE-L': SpatialLabelEncoder_L,
     'SLE-H': SpatialLabelEncoder_H,
+    'SLE-E': EmbeddingLabelEncoder_E,   # E = Embedding-only baseline
 }

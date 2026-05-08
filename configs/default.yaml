@@ -23,6 +23,11 @@ model:
   label_in_context_start: 4             # Layer to inject in-context tokens
   label_init_logsigma: -2.0             # Initial log(σ) for Gaussian heads
 
+  # 当置为 true 时，跳过 Transformer 标签编码器，直接通过 nn.Embedding
+  # 把 label 映射到 [h, w, latent_dim] 的高斯参数 (μ, logσ)。
+  # 该开关优先级高于 label_encoder_variant，用于消融实验或快速 baseline。
+  use_embedding_label_encoder: false
+
 training:
   # Per-GPU batch size. Effective batch = batch_size * accum_iter * num_gpus
   batch_size: 64
