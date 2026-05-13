@@ -5,7 +5,7 @@ model:
   image_channels: 3
 
   # Flux2-style VAE config
-  vae_variant: "VAE-B"                  # VAE-B | VAE-L | VAE-H
+  vae_variant: "VAE-H"                  # VAE-B | VAE-L | VAE-H
   ch: 128                               # Base channel width (used if vae_variant is custom)
   ch_mult: [1, 2, 4, 4]                 # Channel multipliers → [128, 256, 512, 512]
   num_res_blocks: 2                     # ResBlocks per stage (encoder: 2, decoder: 3)
@@ -21,17 +21,23 @@ model:
   label_mlp_ratio: 4.0
   label_in_context_len: 32              # In-context label tokens
   label_in_context_start: 4             # Layer to inject in-context tokens
-  label_init_logsigma: -2.0             # Initial log(σ) for Gaussian heads
+  # Initial log(σ) for label-side Gaussian heads.
+  #   -2.0 → σ≈0.135   (太小，σ_img 会主动坍缩到这一常数水平，σ_label 失去学习信号)
+  #   -1.0 → σ≈0.368
+  #   -0.5 → σ≈0.607
+  #    0.0 → σ≈1.000   (与 VAE encoder 初始输出 σ≈1 对称，KL 初值最小、无方向偏置；
+  #                     符合标准正态先验直觉，需配合略低的 weight_alignment 防止重建受噪声干扰)
+  label_init_logsigma: 0.0
 
   # 当置为 true 时，跳过 Transformer 标签编码器，直接通过 nn.Embedding
   # 把 label 映射到 [h, w, latent_dim] 的高斯参数 (μ, logσ)。
   # 该开关优先级高于 label_encoder_variant，用于消融实验或快速 baseline。
-  use_embedding_label_encoder: false
+  use_embedding_label_encoder: true
 
 training:
   # Per-GPU batch size. Effective batch = batch_size * accum_iter * num_gpus
-  batch_size: 64
-  accum_iter: 2                         # Gradient accumulation steps (increase to simulate larger batch)
+  batch_size: 16
+  accum_iter: 4                         # Gradient accumulation steps (increase to simulate larger batch)
   num_workers: 8
   epochs: 100
 
@@ -46,8 +52,8 @@ training:
 
   # Loss weights (alignment uses mean reduction)
   weight_recon: 1.0
-  weight_alignment: 2.0                 # KL(q_img || q_label) — forward alignment (diversity-preserving)
-  weight_alignment_reverse: 0.5         # KL(q_label || q_img) — stabilize μ alignment, prevent σ overshoot
+  weight_alignment: 1.0                 # KL(q_img || q_label) — forward alignment (diversity-preserving)
+  weight_alignment_reverse: 0.1         # KL(q_label || q_img) — stabilize μ alignment, prevent σ overshoot
 
   # Gaussian alignment temperature
   alignment_temp: 1.0

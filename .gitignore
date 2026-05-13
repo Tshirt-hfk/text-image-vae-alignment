@@ -12,3 +12,4 @@ checkpoints/
 data/
 wandb/
 logs/
+output_dir/
