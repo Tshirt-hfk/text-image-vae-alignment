@@ -1,9 +1,11 @@
 # ============================================================================
 # COCO Text-to-Image 训练配置
 # ----------------------------------------------------------------------------
-# 启动方式与原配置相同：
-#   python train.py --config configs/coco_t2i.yaml
-#   torchrun --nproc_per_node=8 train.py --config configs/coco_t2i.yaml
+# 启动方式（统一走 Hugging Face accelerate）：
+#   单卡:
+#     accelerate launch --num_processes 1 train.py --config configs/coco_t2i.yaml
+#   8 卡（推荐 bf16, Ampere+/Hopper）:
+#     accelerate launch --multi_gpu --num_processes 8 train.py --config configs/coco_t2i.yaml
 #
 # 数据准备（推荐 COCO 2017）：
 #   data_root/
@@ -74,7 +76,12 @@ training:
 
   # ── 优化 ──────────────────────────────────────────────
   grad_clip: 1.0
-  use_amp: true
+  # AMP / 混合精度，映射到 accelerate `mixed_precision`：
+  #   fp16 → fp16 (自动 GradScaler)
+  #   bf16 → bf16 (Ampere+，无 GradScaler，KL 损失更稳定)
+  #   fp32 → no   (关闭 AMP)
+  # 也可被 `--amp_dtype xxx` 或 `accelerate launch --mixed_precision xxx` 覆盖。
+  amp_dtype: "bf16"
   use_compile: false
 
   # ── 日志/保存 ─────────────────────────────────────────

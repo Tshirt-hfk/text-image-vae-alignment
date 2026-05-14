@@ -55,7 +55,12 @@ training:
   grad_clip: 1.0
 
   # Performance optimization
-  use_amp: true                          # AMP mixed-precision training
+  # amp_dtype: AMP / mixed-precision dtype, mapped to accelerate `mixed_precision`:
+  #   fp16 → fp16 (auto GradScaler)
+  #   bf16 → bf16 (Ampere+, no GradScaler — recommended for stable KL gradients)
+  #   fp32 → no   (disable AMP entirely)
+  # Can be overridden by `--amp_dtype ...` or `accelerate launch --mixed_precision ...`.
+  amp_dtype: "bf16"
   use_compile: false                     # torch.compile (PyTorch 2.0+, set true to enable kernel fusion)
 
   # Logging and checkpointing
@@ -90,15 +95,16 @@ logging:
   wandb_project: "spatial-alignment-vae"
 
 # ============================================================================
-# Distributed training config
+# Launch (powered by Hugging Face accelerate)
 # ============================================================================
-# Launch command examples:
+#   0) (one-time) generate a default accelerate config interactively
+#        accelerate config
 #
-#   Single GPU:
-#     python train.py --config configs/imagenet_l2i.yaml
+#   1) Single GPU
+#        accelerate launch --num_processes 1 train.py --config configs/imagenet_l2i.yaml
 #
-#   8 GPUs on one machine, with base LR scaling:
-#     torchrun --nproc_per_node=8 train.py --config configs/imagenet_l2i.yaml
+#   2) 8 GPUs on one node (recommended; bf16 if Ampere+/Hopper)
+#        accelerate launch --multi_gpu --num_processes 8 train.py --config configs/imagenet_l2i.yaml
 #
-#   Resume from checkpoint:
-#     torchrun --nproc_per_node=8 train.py --config configs/imagenet_l2i.yaml --resume ./output_dir
+#   3) Resume from latest checkpoint
+#        accelerate launch --multi_gpu --num_processes 8 train.py --config configs/imagenet_l2i.yaml --resume ./output_dir

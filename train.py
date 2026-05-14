@@ -1,15 +1,30 @@
 """
-Training script for AlignmentVAE — single-machine multi-GPU (DDP).
+Training script for AlignmentVAE — built on Hugging Face accelerate.
 
     Image → VAE Encoder              → N(μ, σ²)  [B, h, w, D]
     Label → EmbeddingLabelEncoder    → N(μ, σ²)  [B, h, w, D]   (cond_type='label')
     Text  → SpatialTextEncoder       → N(μ, σ²)  [B, h, w, D]   (cond_type='text')
 
-Loss = MSE recon + VAE KL + Alignment KL + Label entropy
+Loss = MSE recon + Alignment KL (forward) + Alignment KL (reverse, optional)
+
+`accelerate` transparently handles DDP, AMP autocast, GradScaler (fp16 only),
+gradient accumulation + DDP no_sync, and checkpoint sharding. We keep this
+script focused on business logic.
 
 Usage:
-    python train.py --config configs/imagenet_l2i.yaml
-    torchrun --nproc_per_node=4 train.py --config configs/imagenet_l2i.yaml
+    # 0) (one-time) generate a default accelerate config
+    accelerate config
+
+    # 1) Single GPU
+    accelerate launch --num_processes 1 train.py --config configs/imagenet_l2i.yaml
+
+    # 2) 8-GPU single node
+    accelerate launch --multi_gpu --num_processes 8 \
+        train.py --config configs/imagenet_l2i.yaml
+
+    # 3) Override mixed precision on the fly (bf16 on Ampere+ recommended)
+    accelerate launch --multi_gpu --num_processes 8 --mixed_precision bf16 \
+        train.py --config configs/imagenet_l2i.yaml
 """
 
 import argparse
@@ -21,7 +36,6 @@ import sys
 import time
 import warnings
 import yaml
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -33,10 +47,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
 from torchvision import transforms
+
+from accelerate import Accelerator
+from accelerate.utils import set_seed, ProjectConfiguration
 
 from model import AlignmentVAE
 from model.label_encoder import EmbeddingLabelEncoder
@@ -55,7 +70,7 @@ import util.lr_sched as lr_sched
 # ============================================================================
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('AlignmentVAE Training', add_help=True)
+    parser = argparse.ArgumentParser('AlignmentVAE Training (accelerate)', add_help=True)
 
     # config file
     parser.add_argument('--config', type=str, default='configs/imagenet_l2i.yaml')
@@ -72,7 +87,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', type=int, default=None,
                         help='Per-GPU batch size')
     parser.add_argument('--accum_iter', type=int, default=None,
-                        help='Gradient accumulation steps (effective batch = batch_size * accum_iter * num_gpus)')
+                        help='Gradient accumulation steps. Effective batch = batch_size * accum_iter * num_processes')
     parser.add_argument('--lr', type=float, default=None)
     parser.add_argument('--blr', type=float, default=None,
                         help='Base LR: actual = blr * eff_batch / 256')
@@ -88,40 +103,30 @@ def get_args_parser():
     parser.add_argument('--pin_mem', action='store_true', default=True)
     parser.add_argument('--no_pin_mem', action='store_false', dest='pin_mem')
 
-    # performance
-    parser.add_argument('--use_amp', action='store_true', default=True,
-                        help='Enable AMP (automatic mixed precision) training')
-    parser.add_argument('--no_amp', action='store_false', dest='use_amp',
-                        help='Disable AMP training')
-    parser.add_argument('--amp_dtype', type=str, default="bf16",
+    # performance — accelerate handles AMP/DDP. We only declare dtype here and
+    # forward it to Accelerator(mixed_precision=...).
+    parser.add_argument('--amp_dtype', type=str, default=None,
                         choices=['fp16', 'bf16', 'fp32'],
-                        help='AMP autocast dtype. fp16 (default, needs GradScaler) | '
-                             'bf16 (Ampere/Hopper, no GradScaler, more numerically stable) | '
-                             'fp32 (disable AMP). Overrides yaml `amp_dtype`.')
+                        help='Mixed precision dtype. fp16 (needs GradScaler) | '
+                             'bf16 (Ampere+, recommended) | fp32 (disable AMP). '
+                             'Maps to accelerate `mixed_precision` (no/fp16/bf16). '
+                             'Overrides yaml `amp_dtype` and `accelerate launch --mixed_precision`.')
     parser.add_argument('--use_compile', action='store_true', default=False,
-                        help='Enable torch.compile for model optimization (PyTorch 2.0+)')
+                        help='Enable torch.compile (PyTorch 2.0+)')
 
     # misc
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--output_dir', type=str, default='./output_dir')
-    parser.add_argument('--resume', type=str, default='')
+    parser.add_argument('--resume', type=str, default='',
+                        help='Path to a checkpoint dir saved by accelerator.save_state(); '
+                             'if it points to {output_dir}, the latest "checkpoint-last" '
+                             'subdir will be picked up automatically.')
     parser.add_argument('--start_epoch', type=int, default=0)
     parser.add_argument('--save_freq', type=int, default=None)
     parser.add_argument('--log_freq', type=int, default=None)
 
-    # distributed
-    parser.add_argument('--world_size', default=1, type=int)
-    parser.add_argument('--local_rank', default=-1, type=int)
-    parser.add_argument('--dist_on_itp', action='store_true')
-    parser.add_argument('--dist_url', default='env://')
-    parser.add_argument('--device', default='cuda')
-
     return parser
 
-
-# ============================================================================
-# Config Merge
-# ============================================================================
 
 def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     """Merge YAML config with CLI args (CLI takes priority)."""
@@ -144,14 +149,11 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.label_init_logsigma = model_cfg.get('label_init_logsigma', -2.0)
 
     # ── 条件编码器选择 ────────────────────────────────────────
-    # cond_type:
-    #   'label' → EmbeddingLabelEncoder              (默认；ImageNet 等离散类条件)
-    #   'text'  → TextEncoderWrapper + SpatialTextEncoder (COCO/CC3M T2I)
     args.cond_type = model_cfg.get('cond_type', 'label')
     assert args.cond_type in ('label', 'text'), \
         f"cond_type must be one of 'label' | 'text', got {args.cond_type!r}"
 
-    # ── T2I 扩展配置（仅 cond_type='text' 时生效） ───────────
+    # ── T2I 扩展配置 ────────────────────────────────────────
     args.text_encoder_name = model_cfg.get('text_encoder_name', 'clip')
     args.text_encoder_pretrained = model_cfg.get('text_encoder_pretrained', None)
     args.text_encoder_freeze = bool(model_cfg.get('text_encoder_freeze', True))
@@ -176,7 +178,7 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     if args.lr is None and args.blr is None:
         args.lr = lr_from_cfg
 
-    # Loss weights (explicit float() to guard against YAML parsing '1e-4' as str)
+    # Loss weights
     args.weight_recon = float(train_cfg.get('weight_recon', 1.0))
     args.weight_alignment = float(train_cfg.get('weight_alignment', 0.1))
     args.weight_alignment_reverse = float(train_cfg.get('weight_alignment_reverse', 0.0))
@@ -184,9 +186,8 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
 
     # Dataset
     args.data_path = args.data_path or train_cfg.get('data_root', './data/imagenet')
-    # dataset_type: 'imagenet' (旧) | 'text_image' (新)
     args.dataset_type = train_cfg.get('dataset_type', 'imagenet')
-    args.dataset_format = train_cfg.get('dataset_format', 'auto')   # coco | csv | jsonl | auto
+    args.dataset_format = train_cfg.get('dataset_format', 'auto')
 
     # Workers / logging
     args.num_workers = (args.num_workers if args.num_workers is not None
@@ -201,20 +202,16 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.compute_fid = train_cfg.get('compute_fid', False)
     args.fid_num_samples = train_cfg.get('fid_num_samples', 10000)
 
-    # Performance (CLI flags override YAML)
-    if not hasattr(args, 'use_amp') or args.use_amp is True:
-        args.use_amp = train_cfg.get('use_amp', True)
+    # Performance
     if not hasattr(args, 'use_compile') or args.use_compile is False:
         args.use_compile = train_cfg.get('use_compile', False)
 
-    # AMP dtype: CLI > YAML > default('fp16'); 'fp32' implies use_amp=False
+    # AMP dtype: CLI > YAML > default('fp16')
     cli_amp_dtype = getattr(args, 'amp_dtype', None)
     yaml_amp_dtype = train_cfg.get('amp_dtype', None)
     args.amp_dtype = (cli_amp_dtype or yaml_amp_dtype or 'fp16').lower()
     assert args.amp_dtype in ('fp16', 'bf16', 'fp32'), \
         f"amp_dtype must be 'fp16' | 'bf16' | 'fp32', got {args.amp_dtype!r}"
-    if args.amp_dtype == 'fp32':
-        args.use_amp = False
 
     args.yaml_config = cfg
     return args
@@ -275,14 +272,8 @@ def compute_fid_from_features(feats_real: np.ndarray, feats_gen: np.ndarray) -> 
 class MetricsComputer:
     """Evaluation metrics: MSE, PSNR, SSIM, Inception features.
 
-    PSNR is sensitive to data range. When inputs are normalized with ImageNet
-    mean/std (typical range ≈ [-2.12, 2.64]), the previous heuristic
-    `max_val = 1.0 if x.max() <= 1.0 else 255.0` incorrectly fell back to 255,
-    giving wildly inflated PSNR values (~57 dB instead of true ~9 dB).
-
-    To get a meaningful PSNR, this class accepts the normalization stats
-    (`mean`, `std`) used by the data pipeline and de-normalizes tensors back
-    to [0, 1] before computing PSNR (with MAX=1.0).
+    PSNR de-normalizes inputs back to [0, 1] using the same (mean, std) the
+    data pipeline applied, so the resulting dB values are physically meaningful.
     """
 
     def __init__(
@@ -296,8 +287,6 @@ class MetricsComputer:
         self._ssim_kernel_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.inception = InceptionV3Features(device) if compute_fid else None
 
-        # Cache (mean, std) tensors for de-normalization. Shape [1, C, 1, 1] so
-        # they broadcast with [B, C, H, W] inputs without per-call allocation.
         if mean is not None and std is not None:
             self._denorm_mean = torch.tensor(mean, device=device).view(1, -1, 1, 1)
             self._denorm_std = torch.tensor(std, device=device).view(1, -1, 1, 1)
@@ -306,11 +295,6 @@ class MetricsComputer:
             self._denorm_std = None
 
     def _denormalize_to_unit(self, x: torch.Tensor) -> torch.Tensor:
-        """De-normalize x using stored (mean, std) and clamp to [0, 1].
-
-        If no stats were provided, returns x unchanged so the caller can
-        fall back to its own heuristic. Channel count must match.
-        """
         if self._denorm_mean is None or self._denorm_std is None:
             return x
         mean = self._denorm_mean.to(dtype=x.dtype, device=x.device)
@@ -319,7 +303,6 @@ class MetricsComputer:
 
     def _get_ssim_kernel(self, channels: int, window_size: int,
                          device: torch.device) -> torch.Tensor:
-        """Get or create cached SSIM Gaussian kernel."""
         key = (channels, window_size, str(device))
         if key not in self._ssim_kernel_cache:
             sigma = 1.5
@@ -336,28 +319,14 @@ class MetricsComputer:
         return torch.mean((x - x_recon) ** 2).item()
 
     def compute_psnr(self, x: torch.Tensor, x_recon: torch.Tensor) -> float:
-        """Peak Signal-to-Noise Ratio with consistent data range.
-
-        Both `x` and `x_recon` are first de-normalized to [0, 1] using the
-        cached (mean, std) so MSE and MAX live in the same numeric space.
-        Without this, ImageNet-normalized inputs (range ≈ [-2.12, 2.64])
-        would mis-trigger the old `max_val=255` branch, producing nonsense
-        PSNR values (e.g. ~57 dB) that don't reflect true reconstruction quality.
-
-        Falls back to the original heuristic only when no normalization stats
-        are configured (e.g., legacy callers passing already-unit-range tensors).
-        """
         if self._denorm_mean is not None and self._denorm_std is not None:
             x_unit = self._denormalize_to_unit(x)
             x_recon_unit = self._denormalize_to_unit(x_recon)
             mse = torch.mean((x_unit - x_recon_unit) ** 2)
             if mse == 0:
                 return float('inf')
-            # MAX = 1.0 because both tensors are now clamped to [0, 1].
             return (-10.0 * torch.log10(mse)).item()
 
-        # Legacy fallback: assume caller-provided tensors are already in
-        # either [0, 1] or [0, 255]. Kept for backward compatibility.
         mse = torch.mean((x - x_recon) ** 2)
         if mse == 0:
             return float('inf')
@@ -367,7 +336,6 @@ class MetricsComputer:
     def compute_ssim(self, x: torch.Tensor, x_recon: torch.Tensor,
                      window_size: int = 11,
                      C1: float = 0.01**2, C2: float = 0.03**2) -> float:
-        """SSIM between original and reconstructed images."""
         C = x.shape[1]
         window = self._get_ssim_kernel(C, window_size, x.device)
         pad = window_size // 2
@@ -386,30 +354,24 @@ class MetricsComputer:
 
     @torch.no_grad()
     def extract_inception_features(self, images: torch.Tensor) -> np.ndarray:
-        """[B,3,H,W] → [B,2048] numpy."""
         return self.inception(images).cpu().numpy()
 
 
 # ============================================================================
-# Batch helpers — 统一处理 (image, label) 与 dict-batch 两种格式
+# Batch helpers
 # ============================================================================
 
 def _unpack_batch(batch):
-    """
-    返回 (images, cond)
-      - 旧格式 (image, label) tuple/list → cond 为 LongTensor[B]
-      - 新格式 dict {image, input_ids, attention_mask} → cond 为 dict
-    """
+    """Returns (images, cond). Supports both (image, label) tuple and dict batch."""
     if isinstance(batch, dict):
         image = batch["image"]
         cond = {k: v for k, v in batch.items() if k != "image"}
         return image, cond
-    # tuple / list
     return batch[0], batch[1]
 
 
 def _cond_to_device(cond, device):
-    """把 cond 中的所有 tensor 搬到 device。"""
+    """Move all tensors inside cond to device."""
     if isinstance(cond, dict):
         return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
                 for k, v in cond.items()}
@@ -430,8 +392,6 @@ def _fmt_params(n: int) -> str:
 
 def build_model(args) -> AlignmentVAE:
     """Build AlignmentVAE from config args."""
-
-    # VAE
     vae_variant = getattr(args, 'vae_variant', 'VAE-B')
     if vae_variant in VAE_models:
         vae = VAE_models[vae_variant](
@@ -446,11 +406,8 @@ def build_model(args) -> AlignmentVAE:
             double_z=args.double_z,
         )
 
-    # ── Conditioning encoder ─────────────────────────────────────────────────
     cond_type = getattr(args, 'cond_type', 'label')
-
     if cond_type == 'text':
-        # —— T2I 模式：HF 文本编码器 + SpatialTextEncoder ——
         text_encoder_wrapper = TextEncoderWrapper(
             model_name=args.text_encoder_name,
             pretrained_path=args.text_encoder_pretrained,
@@ -481,9 +438,7 @@ def build_model(args) -> AlignmentVAE:
                 init_logsigma=args.label_init_logsigma,
             )
         sle_variant = f"{ste_variant} ({args.text_encoder_name})"
-
     else:
-        # —— Label 模式：EmbeddingLabelEncoder（轻量、无 Transformer） ——
         sle_variant = 'EmbedLabel'
         label_encoder = EmbeddingLabelEncoder(
             input_size=args.input_size, patch_size=16,
@@ -491,7 +446,6 @@ def build_model(args) -> AlignmentVAE:
             init_logsigma=args.label_init_logsigma,
         )
 
-    # Assemble
     model = AlignmentVAE(
         input_size=args.input_size,
         latent_dim=args.latent_dim,
@@ -504,7 +458,6 @@ def build_model(args) -> AlignmentVAE:
         weight_alignment_reverse=args.weight_alignment_reverse,
     )
 
-    # Print summary
     enc_params = sum(p.numel() for p in model.vae.encoder.parameters())
     dec_params = sum(p.numel() for p in model.vae.decoder.parameters())
     vae_params = sum(p.numel() for p in model.vae.parameters())
@@ -530,82 +483,105 @@ def build_model(args) -> AlignmentVAE:
 
 
 # ============================================================================
+# Accelerate helpers
+# ============================================================================
+
+def _sync_metric_logger(metric_logger: misc.MetricLogger, accelerator: Accelerator):
+    """All-reduce SmoothedValue counters across processes via accelerate.
+
+    Replaces `metric_logger.synchronize_between_processes()` whose hard-coded
+    `device='cuda'` is unsafe under multi-GPU (would default to cuda:0 on every
+    rank). accelerator.reduce honours each rank's actual device.
+    """
+    if accelerator.num_processes <= 1:
+        return
+    for meter in metric_logger.meters.values():
+        t = torch.tensor([meter.count, meter.total],
+                         dtype=torch.float64, device=accelerator.device)
+        gathered = accelerator.reduce(t, reduction='sum')
+        meter.count = int(gathered[0].item())
+        meter.total = float(gathered[1].item())
+
+
+def _gather_numpy(arr: np.ndarray, accelerator: Accelerator) -> np.ndarray:
+    """Gather a per-rank numpy array across processes; returns concatenated np."""
+    if accelerator.num_processes <= 1:
+        return arr
+    t = torch.from_numpy(arr).to(accelerator.device)
+    gathered = accelerator.gather(t)
+    return gathered.cpu().numpy()
+
+
+def _save_checkpoint(accelerator: Accelerator, args, epoch: int, name: str):
+    """Save full training state via accelerator (model + optim + scaler + RNG)
+    plus a small `meta.pt` carrying epoch / args for resume bookkeeping."""
+    ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{name}")
+    accelerator.save_state(ckpt_dir)
+    if accelerator.is_main_process:
+        torch.save(
+            {'epoch': epoch, 'args': vars(args)},
+            os.path.join(ckpt_dir, "meta.pt"),
+        )
+
+
+# ============================================================================
 # Training Engine
 # ============================================================================
 
 def train_one_epoch(
     model: nn.Module,
+    accelerator: Accelerator,
     data_loader: DataLoader,
     optimizer: torch.optim.Optimizer,
-    device: torch.device,
     epoch: int,
-    scaler: Optional[GradScaler] = None,
-    log_writer=None,
-    args=None,
-    amp_dtype: torch.dtype = torch.float16,
+    args,
 ):
-    """Train for one epoch with AMP, per-iteration LR scheduling and gradient accumulation."""
+    """Train for one epoch.
+
+    accelerate handles for us:
+      - autocast(dtype=...) via `mixed_precision`
+      - GradScaler scale/unscale (fp16 only)
+      - DDP no_sync within accumulation window (via `accelerator.accumulate`)
+      - loss /= gradient_accumulation_steps inside `accelerator.backward`
+    """
     model.train()
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = f'[Epoch {epoch + 1}/{args.epochs}]'
     print_freq = args.log_freq
-    accum_iter = getattr(args, 'accum_iter', 1)
-    use_amp = getattr(args, 'use_amp', True) and device.type == 'cuda'
+    accum_iter = max(1, getattr(args, 'accum_iter', 1))
 
-    # Use set_to_none=False with gradient_as_bucket_view=True:
-    # DDP bucket views serve as .grad storage, zero_grad() clears them in-place,
-    # backward accumulates directly into buckets — avoids cuDNN channels_last stride mismatch.
     optimizer.zero_grad()
 
     for step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         images, cond = _unpack_batch(batch)
+        # accelerate moves prepared-loader tensors automatically; cond may be a
+        # nested dict (T2I). Be explicit so we never depend on auto-handling.
+        cond = _cond_to_device(cond, accelerator.device)
 
-        # Only adjust LR at the boundary of each accumulation window
+        # Per-iteration LR schedule, fired only at accumulation boundaries.
         if step % accum_iter == 0:
             fractional_epoch = step / len(data_loader) + epoch
             lr_sched.adjust_learning_rate(optimizer, fractional_epoch, args)
 
-        images = images.to(device, non_blocking=True)
-        cond = _cond_to_device(cond, device)
+        with accelerator.accumulate(model):
+            x_recon, loss, metrics = model(images, cond)
+            accelerator.backward(loss)
 
-        # Use no_sync context for non-update steps in DDP to avoid redundant all-reduce
-        if accum_iter > 1 and hasattr(model, 'no_sync'):
-            sync_ctx = model.no_sync if (step + 1) % accum_iter != 0 else nullcontext
-        else:
-            sync_ctx = nullcontext
+            # Gradient clipping must run only on update steps, after gradients
+            # have been all-reduced (sync_gradients=True at the boundary).
+            if accelerator.sync_gradients and args.grad_clip > 0:
+                accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-        with sync_ctx():
-            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                x_recon, loss, metrics = model(images, cond)
-                loss = loss / accum_iter  # Normalize loss by accumulation steps
-
-        loss_value = loss.item() * accum_iter  # Un-scale for logging (show true per-sample loss)
-        if not math.isfinite(loss_value):
-            print(f"Loss is {loss_value}, stopping training", flush=True)
-            sys.exit(1)
-
-        # AMP-aware backward pass
-        if scaler is not None:
-            scaler.scale(loss).backward()
-        else:
-            loss.backward()
-
-        # Optimizer step at the end of each accumulation window
-        if (step + 1) % accum_iter == 0:
-            if scaler is not None:
-                if args.grad_clip > 0:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+            optimizer.step()
             optimizer.zero_grad()
 
-        # Update local metrics (removed torch.cuda.synchronize() — unnecessary bottleneck)
+        # Logging — loss.item() is the un-scaled per-batch loss
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            accelerator.print(f"Loss is {loss_value}, stopping training", flush=True)
+            sys.exit(1)
+
         metric_logger.update(loss=loss_value)
         metric_logger.update(loss_recon=metrics.get('loss_recon', 0))
         metric_logger.update(loss_align=metrics.get('loss_alignment', 0))
@@ -615,55 +591,52 @@ def train_one_epoch(
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
-        # all_reduce must be called by ALL ranks (collective op), but only log on rank 0
+        # Per-step tensorboard log (loss reduced across processes for accuracy)
         if step % args.log_freq == 0:
-            loss_value_reduce = misc.all_reduce_mean(loss_value)
-            if log_writer is not None:
-                epoch_1000x = int((step / len(data_loader) + epoch) * 1000)
-                log_writer.add_scalar('train/loss', loss_value_reduce, epoch_1000x)
-                log_writer.add_scalar('train/loss_recon', metrics.get('loss_recon', 0), epoch_1000x)
-                log_writer.add_scalar('train/loss_alignment', metrics.get('loss_alignment', 0), epoch_1000x)
-                log_writer.add_scalar('train/loss_kl_reverse', metrics.get('loss_kl_reverse', 0), epoch_1000x)
-                log_writer.add_scalar('train/mean_sigma_label', metrics.get('mean_sigma_label', 0), epoch_1000x)
-                log_writer.add_scalar('train/mean_sigma_img', metrics.get('mean_sigma_img', 0), epoch_1000x)
-                log_writer.add_scalar('train/lr', lr, epoch_1000x)
+            loss_t = torch.tensor(loss_value, device=accelerator.device)
+            loss_value_reduce = accelerator.reduce(loss_t, reduction='mean').item()
+            epoch_1000x = int((step / len(data_loader) + epoch) * 1000)
+            accelerator.log({
+                'train/loss':            loss_value_reduce,
+                'train/loss_recon':      metrics.get('loss_recon', 0),
+                'train/loss_alignment':  metrics.get('loss_alignment', 0),
+                'train/loss_kl_reverse': metrics.get('loss_kl_reverse', 0),
+                'train/mean_sigma_label': metrics.get('mean_sigma_label', 0),
+                'train/mean_sigma_img':  metrics.get('mean_sigma_img', 0),
+                'train/lr':              lr,
+            }, step=epoch_1000x)
 
-    metric_logger.synchronize_between_processes()
-    print("Averaged stats:", metric_logger)
+    _sync_metric_logger(metric_logger, accelerator)
+    accelerator.print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 @torch.no_grad()
 def evaluate(
     model: nn.Module,
+    accelerator: Accelerator,
     data_loader: DataLoader,
-    device: torch.device,
     metrics_computer: MetricsComputer,
     compute_fid: bool = False,
     fid_num_samples: int = 10000,
     header: str = "Val:",
-    use_amp: bool = True,
-    amp_dtype: torch.dtype = torch.float16,
 ):
     """Evaluate: loss, MSE, PSNR, SSIM, recon/gen FID."""
     model.eval()
     metric_logger = misc.MetricLogger(delimiter="  ")
-    use_amp = use_amp and device.type == 'cuda'
 
     feats_real_list, feats_recon_list, feats_gen_list = [], [], []
     fid_samples_collected = 0
 
-    model_unwrapped = model.module if hasattr(model, 'module') else model
+    model_unwrapped = accelerator.unwrap_model(model)
 
     for batch in metric_logger.log_every(data_loader, 50, header):
         images, cond = _unpack_batch(batch)
-        images = images.to(device, non_blocking=True)
-        cond = _cond_to_device(cond, device)
+        cond = _cond_to_device(cond, accelerator.device)
 
-        with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+        with accelerator.autocast():
             x_recon, loss, metrics = model(images, cond)
 
-        # Cast back to float32 for metric computation
         x_recon = x_recon.float()
 
         metric_logger.update(loss=loss.item())
@@ -677,7 +650,6 @@ def evaluate(
         metric_logger.update(psnr=metrics_computer.compute_psnr(images, x_recon))
         metric_logger.update(ssim=metrics_computer.compute_ssim(images, x_recon))
 
-        # Collect inception features for FID
         if (metrics_computer.inception is not None
                 and fid_samples_collected < fid_num_samples):
             feats_real_list.append(metrics_computer.extract_inception_features(images))
@@ -687,22 +659,17 @@ def evaluate(
                 feats_gen_list.append(metrics_computer.extract_inception_features(x_gen))
             fid_samples_collected += images.shape[0]
 
-    metric_logger.synchronize_between_processes()
+    _sync_metric_logger(metric_logger, accelerator)
     results = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
-    # Compute FID from collected features
+    # FID: gather features across processes, compute on main only
     if feats_real_list:
-        feats_real = np.concatenate(feats_real_list, axis=0)
-        feats_recon = np.concatenate(feats_recon_list, axis=0)
-        feats_gen = np.concatenate(feats_gen_list, axis=0) if feats_gen_list else None
+        feats_real = _gather_numpy(np.concatenate(feats_real_list, axis=0), accelerator)
+        feats_recon = _gather_numpy(np.concatenate(feats_recon_list, axis=0), accelerator)
+        feats_gen = (_gather_numpy(np.concatenate(feats_gen_list, axis=0), accelerator)
+                     if feats_gen_list else None)
 
-        # DDP gather
-        if misc.get_world_size() > 1:
-            feats_real, feats_recon, feats_gen = _gather_fid_features(
-                feats_real, feats_recon, feats_gen, device
-            )
-
-        if misc.is_main_process():
+        if accelerator.is_main_process:
             n = len(feats_real)
             try:
                 recon_fid = compute_fid_from_features(feats_real, feats_recon)
@@ -719,31 +686,19 @@ def evaluate(
                 except Exception as e:
                     print(f"  [WARN] Gen FID failed: {e}")
 
-    print(f"{header}", metric_logger)
+    accelerator.print(f"{header}", metric_logger)
     return results
-
-
-def _gather_fid_features(feats_real, feats_recon, feats_gen, device):
-    """all_gather FID features across DDP ranks."""
-    def _gather(arr):
-        t = torch.from_numpy(arr).to(device)
-        gathered = [torch.zeros_like(t) for _ in range(misc.get_world_size())]
-        torch.distributed.all_gather(gathered, t)
-        return torch.cat(gathered, dim=0).cpu().numpy()
-
-    feats_real = _gather(feats_real)
-    feats_recon = _gather(feats_recon)
-    if feats_gen is not None:
-        feats_gen = _gather(feats_gen)
-    return feats_real, feats_recon, feats_gen
 
 
 # ============================================================================
 # Config Printing
 # ============================================================================
 
-def _print_config(args):
-    """Print hyperparameters in a grouped table."""
+def _print_config(args, accelerator: Accelerator):
+    """Print hyperparameters in a grouped table (main process only)."""
+    if not accelerator.is_main_process:
+        return
+
     sep = "=" * 58
 
     def _section(title, entries):
@@ -775,17 +730,17 @@ def _print_config(args):
         ("double_z",              str(args.double_z)),
     ])
 
-    eff_bs = args.batch_size * args.accum_iter * getattr(args, 'world_size', 1)
+    eff_bs = args.batch_size * args.accum_iter * accelerator.num_processes
     _section("Training", [
-        ("epochs",               str(args.epochs)),
-        ("batch_size (per GPU)", str(args.batch_size)),
-        ("accum_iter",           str(args.accum_iter)),
-        ("effective batch size", str(eff_bs)),
+        ("epochs",                str(args.epochs)),
+        ("batch_size (per GPU)",  str(args.batch_size)),
+        ("accum_iter",            str(args.accum_iter)),
+        ("effective batch size",  str(eff_bs)),
         ("lr / lr_label_encoder", f"{args.lr:.1e} / {args.lr_label_encoder:.1e}"),
-        ("lr_schedule",          str(args.lr_schedule)),
-        ("warmup_epochs",        str(args.warmup_epochs)),
-        ("weight_decay",         str(args.weight_decay)),
-        ("grad_clip",            str(args.grad_clip)),
+        ("lr_schedule",           str(args.lr_schedule)),
+        ("warmup_epochs",         str(args.warmup_epochs)),
+        ("weight_decay",          str(args.weight_decay)),
+        ("grad_clip",             str(args.grad_clip)),
     ])
 
     _section("Loss Weights", [
@@ -797,23 +752,23 @@ def _print_config(args):
     ])
 
     _section("Data", [
-        ("data_path",           str(args.data_path)),
-        ("num_workers",         str(args.num_workers)),
+        ("data_path",   str(args.data_path)),
+        ("num_workers", str(args.num_workers)),
     ])
 
-    _section("Distributed & Performance", [
-        ("world_size",          str(getattr(args, 'world_size', 1))),
-        ("distributed",         str(getattr(args, 'distributed', False))),
-        ("device",              str(args.device)),
-        ("use_amp",             str(getattr(args, 'use_amp', True))),
-        ("amp_dtype",           str(getattr(args, 'amp_dtype', 'fp16'))),
-        ("use_compile",         str(getattr(args, 'use_compile', False))),
+    _section("Accelerate / Performance", [
+        ("num_processes",    str(accelerator.num_processes)),
+        ("distributed_type", str(accelerator.distributed_type)),
+        ("device",           str(accelerator.device)),
+        ("mixed_precision",  str(accelerator.mixed_precision)),
+        ("amp_dtype (cfg)",  str(getattr(args, 'amp_dtype', 'fp16'))),
+        ("use_compile",      str(getattr(args, 'use_compile', False))),
     ])
 
     _section("Checkpoint", [
-        ("output_dir",          str(args.output_dir)),
-        ("resume",              str(args.resume) if args.resume else "(none)"),
-        ("save_freq",           str(args.save_freq)),
+        ("output_dir",  str(args.output_dir)),
+        ("resume",      str(args.resume) if args.resume else "(none)"),
+        ("save_freq",   str(args.save_freq)),
     ])
 
     print(sep)
@@ -824,65 +779,65 @@ def _print_config(args):
 # ============================================================================
 
 def main(args):
-    misc.init_distributed_mode(args)
-    print(f"Job directory: {os.path.dirname(os.path.realpath(__file__))}")
-    _print_config(args)
+    # ── Build Accelerator ─────────────────────────────────────────────────
+    # Map our amp_dtype to accelerate's mixed_precision string:
+    #   fp16 → 'fp16' (auto GradScaler)
+    #   bf16 → 'bf16' (no GradScaler, fp32-equivalent range — recommended on Ampere+)
+    #   fp32 → 'no'   (AMP fully off)
+    mixed_precision_map = {'fp16': 'fp16', 'bf16': 'bf16', 'fp32': 'no'}
+    mixed_precision = mixed_precision_map[getattr(args, 'amp_dtype', 'fp16')]
 
-    device = torch.device(args.device)
+    project_config = ProjectConfiguration(
+        project_dir=args.output_dir,
+        logging_dir=os.path.join(args.output_dir, 'tensorboard'),
+        automatic_checkpoint_naming=False,  # we name checkpoints ourselves
+    )
+    accelerator = Accelerator(
+        mixed_precision=mixed_precision,
+        gradient_accumulation_steps=args.accum_iter,
+        log_with="tensorboard" if args.use_tensorboard else None,
+        project_config=project_config,
+    )
 
-    seed = args.seed + misc.get_rank()
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    # Hardware sanity check for bf16
+    if (mixed_precision == 'bf16'
+            and torch.cuda.is_available()
+            and not torch.cuda.is_bf16_supported()):
+        accelerator.print(
+            "[WARN] amp_dtype='bf16' was requested but the current CUDA device "
+            "does NOT natively support bfloat16 (e.g. V100/T4). accelerate may "
+            "fall back to a software emulation; consider --amp_dtype fp16."
+        )
+
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+        print(f"Job directory: {os.path.dirname(os.path.realpath(__file__))}")
+
+    # Init tensorboard tracker (no-op on non-main rank)
+    if args.use_tensorboard:
+        # `init_trackers` requires a JSON-serialisable config — strip yaml dict
+        safe_cfg = {k: v for k, v in vars(args).items()
+                    if isinstance(v, (str, int, float, bool, list, tuple))}
+        accelerator.init_trackers(project_name="alignment_vae", config=safe_cfg)
+
+    _print_config(args, accelerator)
+
+    # Seed (rank-aware via accelerate)
+    set_seed(args.seed, device_specific=True)
     cudnn.benchmark = True
 
-    # AMP / torch.compile flags
-    use_amp = getattr(args, 'use_amp', True) and device.type == 'cuda'
-    use_compile = getattr(args, 'use_compile', False)
-
-    # Resolve AMP autocast dtype (fp16 | bf16 | fp32).
-    #   - fp16: needs GradScaler to avoid gradient underflow
-    #   - bf16: same exponent range as fp32, no GradScaler required, much
-    #           more numerically stable for KL/exp/log heavy losses
-    #   - fp32: AMP fully disabled
-    amp_dtype_str = getattr(args, 'amp_dtype', 'fp16')
-    if amp_dtype_str == 'bf16':
-        amp_dtype = torch.bfloat16
-    elif amp_dtype_str == 'fp16':
-        amp_dtype = torch.float16
-    else:
-        amp_dtype = torch.float32
-    # Warn & fall back if hardware lacks native bf16 support (e.g. V100/T4)
-    if use_amp and amp_dtype == torch.bfloat16 and torch.cuda.is_available():
-        if not torch.cuda.is_bf16_supported():
-            print("[WARN] amp_dtype='bf16' requested but current CUDA device "
-                  "does NOT natively support bfloat16. Falling back to fp16.")
-            amp_dtype = torch.float16
-    use_grad_scaler = use_amp and (amp_dtype == torch.float16)
-
-    num_tasks = misc.get_world_size()
-    global_rank = misc.get_rank()
-
-    # Resolve learning rate (effective batch accounts for accumulation)
-    eff_batch_size = args.batch_size * args.accum_iter * num_tasks
+    # ── LR scaling (effective batch accounts for processes × accum) ─────
+    eff_batch_size = args.batch_size * args.accum_iter * accelerator.num_processes
     if args.blr is not None:
         args.lr = args.blr * eff_batch_size / 256
     lr_scale_label = args.lr_label_encoder / args.yaml_config.get('training', {}).get('lr', 1e-4)
 
-    print(f"Base lr: {args.lr * 256 / eff_batch_size:.2e}")
-    print(f"Actual lr: {args.lr:.2e}")
-    print(f"Effective batch size: {eff_batch_size}")
+    accelerator.print(f"Base lr: {args.lr * 256 / eff_batch_size:.2e}")
+    accelerator.print(f"Actual lr: {args.lr:.2e}")
+    accelerator.print(f"Effective batch size: {eff_batch_size}")
 
-    # TensorBoard
-    if global_rank == 0 and args.output_dir:
-        os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=os.path.join(args.output_dir, 'tensorboard'))
-    else:
-        log_writer = None
-
-    # Dataset
-    # NOTE: Keep these stats in sync with `MetricsComputer(mean=..., std=...)`
-    # below so PSNR de-normalization uses the same constants as the data
-    # pipeline. Mismatching them would silently corrupt PSNR readings again.
+    # ── Datasets & DataLoaders ────────────────────────────────────────────
+    # NOTE: keep these stats in sync with `MetricsComputer(mean=..., std=...)`
     imagenet_mean = (0.485, 0.456, 0.406)
     imagenet_std = (0.229, 0.224, 0.225)
     transform_train = transforms.Compose([
@@ -900,16 +855,13 @@ def main(args):
     ])
 
     if getattr(args, 'dataset_type', 'imagenet') == 'text_image':
-        # —— T2I: COCO Captions / CC3M / 自定义图文对 ——
         from dataset import build_text_image_dataset
-        # 复用 text encoder 同源 tokenizer
         from transformers import AutoTokenizer
         tokenizer_path = (
             args.text_encoder_pretrained
             or TextEncoderWrapper.SUPPORTED.get(args.text_encoder_name, args.text_encoder_name)
         )
         tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-
         train_dataset = build_text_image_dataset(
             root=args.data_path, split="train", tokenizer=tokenizer,
             format=args.dataset_format, max_text_len=args.max_text_len,
@@ -921,7 +873,6 @@ def main(args):
             input_size=args.input_size,
         )
     else:
-        # —— 原 ImageNet 流程 ——
         train_dataset = ImageLabelDataset(
             root=args.data_path, split="train",
             transform=transform_train, num_classes=args.num_classes,
@@ -931,172 +882,129 @@ def main(args):
             transform=transform_val, num_classes=args.num_classes,
         )
 
-    print(f"Dataset: train={len(train_dataset)}, val={len(val_dataset)} "
-          f"[type={getattr(args, 'dataset_type', 'imagenet')}]")
+    accelerator.print(f"Dataset: train={len(train_dataset)}, val={len(val_dataset)} "
+                      f"[type={getattr(args, 'dataset_type', 'imagenet')}]")
 
-    # Samplers
-    if args.distributed:
-        sampler_train = torch.utils.data.DistributedSampler(
-            train_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=True)
-        sampler_val = torch.utils.data.DistributedSampler(
-            val_dataset, num_replicas=num_tasks, rank=global_rank, shuffle=False)
-        print(f"Sampler: DistributedSampler (rank={global_rank}, world={num_tasks})")
-    else:
-        sampler_train = torch.utils.data.RandomSampler(train_dataset)
-        sampler_val = torch.utils.data.SequentialSampler(val_dataset)
-
+    # No manual DistributedSampler: accelerator.prepare wraps DataLoader and
+    # injects the proper sampler / batch sharding for us.
     loader_kwargs = dict(
         batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=args.pin_mem,
-        persistent_workers=args.num_workers > 0,  # Keep worker processes alive between epochs
-        prefetch_factor=4 if args.num_workers > 0 else None,  # Pre-fetch more batches
+        persistent_workers=args.num_workers > 0,
+        prefetch_factor=4 if args.num_workers > 0 else None,
     )
-    data_loader_train = DataLoader(train_dataset, sampler=sampler_train, drop_last=True, **loader_kwargs)
-    data_loader_val = DataLoader(val_dataset, sampler=sampler_val, drop_last=False, **loader_kwargs)
+    data_loader_train = DataLoader(train_dataset, shuffle=True, drop_last=True, **loader_kwargs)
+    data_loader_val = DataLoader(val_dataset, shuffle=False, drop_last=False, **loader_kwargs)
 
-    # Model
+    # ── Model ─────────────────────────────────────────────────────────────
     model = build_model(args)
-    model.to(device)
 
-    # torch.compile for kernel fusion & graph optimization (PyTorch 2.0+)
-    if use_compile:
-        print("Compiling model with torch.compile (mode='reduce-overhead')...")
+    if args.use_compile:
+        accelerator.print("Compiling model with torch.compile (mode='reduce-overhead')...")
         model = torch.compile(model, mode='reduce-overhead')
 
-    if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=False,
-            gradient_as_bucket_view=True)  # Reuse comm buffer as grad storage
-        model_without_ddp = model.module
-    else:
-        model_without_ddp = model
-
-    # Optimizer (separate LR for label encoder; fused=True for CUDA-accelerated AdamW)
+    # ── Optimizer (separate LR for label encoder; fused AdamW where possible) ──
     try:
         import inspect
         fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
     except Exception:
         fused_available = False
-    use_fused = fused_available and device.type == 'cuda'
+    use_fused = fused_available and torch.cuda.is_available()
     extra_optim_kwargs = {'fused': True} if use_fused else {}
-    # 仅把 requires_grad=True 的参数交给优化器
-    # （T2I 模式下文本编码器通常 frozen，避免 AdamW 为其分配 state）
+
     optimizer = torch.optim.AdamW([
-        {'params': [p for p in model_without_ddp.vae.parameters() if p.requires_grad],
+        {'params': [p for p in model.vae.parameters() if p.requires_grad],
          'lr': args.lr},
-        {'params': [p for p in model_without_ddp.label_encoder.parameters() if p.requires_grad],
+        {'params': [p for p in model.label_encoder.parameters() if p.requires_grad],
          'lr': args.lr, 'lr_scale': lr_scale_label},
-    ], weight_decay=args.weight_decay, betas=(0.9, 0.999),
-       **extra_optim_kwargs)
+    ], weight_decay=args.weight_decay, betas=(0.9, 0.999), **extra_optim_kwargs)
     if use_fused:
-        print("Using fused AdamW optimizer (CUDA-accelerated)")
+        accelerator.print("Using fused AdamW optimizer (CUDA-accelerated)")
 
-    # AMP GradScaler — only fp16 needs grad scaling; bf16 has fp32-equivalent
-    # range so its gradients won't underflow.
-    scaler = GradScaler('cuda', enabled=use_grad_scaler) if use_grad_scaler else None
-    if use_amp:
-        print(f"Using AMP (automatic mixed precision): "
-              f"dtype={amp_dtype_str}, GradScaler={'on' if use_grad_scaler else 'off'}")
-    else:
-        print("AMP disabled (training in fp32)")
+    # ── accelerate.prepare wraps everything (DDP / AMP / DataLoader sharding) ──
+    model, optimizer, data_loader_train, data_loader_val = accelerator.prepare(
+        model, optimizer, data_loader_train, data_loader_val
+    )
+    accelerator.print(
+        f"Accelerator ready: distributed_type={accelerator.distributed_type}, "
+        f"num_processes={accelerator.num_processes}, "
+        f"mixed_precision={accelerator.mixed_precision}"
+    )
 
-    # Metrics
-    # Pass the same (mean, std) used by transform_{train,val} so PSNR can
-    # de-normalize tensors back to [0, 1] before computing 10·log10(1/MSE).
+    # ── Metrics ──────────────────────────────────────────────────────────
     metrics_computer = MetricsComputer(
-        device=str(device),
+        device=str(accelerator.device),
         compute_fid=args.compute_fid,
         mean=imagenet_mean,
         std=imagenet_std,
     )
 
-    # Resume
+    # ── Resume ───────────────────────────────────────────────────────────
     if args.resume:
         ckpt_path = args.resume
-        if os.path.isdir(ckpt_path):
-            ckpt_path = os.path.join(ckpt_path, "checkpoint-last.pth")
-        if os.path.exists(ckpt_path):
-            ckpt = torch.load(ckpt_path, map_location='cpu')
-            model_without_ddp.load_state_dict(ckpt['model'])
-            print(f"Resumed model from: {ckpt_path}")
-            if 'optimizer' in ckpt and 'epoch' in ckpt:
-                optimizer.load_state_dict(ckpt['optimizer'])
-                args.start_epoch = ckpt['epoch'] + 1
-                print(f"Resumed optimizer & epoch (start_epoch={args.start_epoch})")
-            if scaler is not None and 'scaler' in ckpt:
-                scaler.load_state_dict(ckpt['scaler'])
-                print("Resumed AMP scaler state")
-            del ckpt
+        if os.path.isdir(ckpt_path) and os.path.basename(ckpt_path).startswith("checkpoint-"):
+            resume_dir = ckpt_path
         else:
-            print(f"[WARN] Checkpoint not found: {ckpt_path}. Training from scratch.")
+            resume_dir = os.path.join(ckpt_path, "checkpoint-last")
+        if os.path.isdir(resume_dir):
+            accelerator.print(f"Resuming from: {resume_dir}")
+            accelerator.load_state(resume_dir)
+            meta_path = os.path.join(resume_dir, "meta.pt")
+            if os.path.exists(meta_path):
+                meta = torch.load(meta_path, map_location='cpu', weights_only=False)
+                args.start_epoch = int(meta.get('epoch', -1)) + 1
+                accelerator.print(f"Resumed epoch: start_epoch={args.start_epoch}")
+        else:
+            accelerator.print(f"[WARN] Checkpoint not found: {resume_dir}. "
+                              "Training from scratch.")
 
-    # Training loop
-    print(f"Start training for {args.epochs} epochs")
+    # ── Training loop ────────────────────────────────────────────────────
+    accelerator.print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     best_val_loss = float('inf')
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            data_loader_train.sampler.set_epoch(epoch)
-
         train_stats = train_one_epoch(
             model=model,
+            accelerator=accelerator,
             data_loader=data_loader_train,
             optimizer=optimizer,
-            device=device,
             epoch=epoch,
-            scaler=scaler,
-            log_writer=log_writer,
             args=args,
-            amp_dtype=amp_dtype,
         )
 
         val_stats = evaluate(
-            model, data_loader_val, device, metrics_computer,
+            model=model,
+            accelerator=accelerator,
+            data_loader=data_loader_val,
+            metrics_computer=metrics_computer,
             compute_fid=args.compute_fid,
             fid_num_samples=args.fid_num_samples,
             header="Val:",
-            use_amp=use_amp,
-            amp_dtype=amp_dtype,
         )
 
-        # TensorBoard logging
-        if log_writer is not None:
-            for k, v in train_stats.items():
-                log_writer.add_scalar(f'epoch_train/{k}', v, epoch)
-            for k, v in val_stats.items():
-                log_writer.add_scalar(f'epoch_val/{k}', v, epoch)
+        # Per-epoch tensorboard logging
+        if args.use_tensorboard:
+            log_payload = {f'epoch_train/{k}': v for k, v in train_stats.items()}
+            log_payload.update({f'epoch_val/{k}': v for k, v in val_stats.items()})
+            accelerator.log(log_payload, step=epoch)
 
-        # Checkpointing
+        # Checkpointing — save_state handles model/optim/scaler/RNG together
         if epoch % args.save_freq == 0 or epoch + 1 == args.epochs:
-            misc.save_model(
-                args=args, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, epoch=epoch, epoch_name="last",
-                scaler=scaler,
-            )
+            _save_checkpoint(accelerator, args, epoch, "last")
         if epoch > 0 and epoch % 50 == 0:
-            misc.save_model(
-                args=args, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, epoch=epoch, scaler=scaler,
-            )
+            _save_checkpoint(accelerator, args, epoch, str(epoch))
 
         val_loss = val_stats.get('loss', float('inf'))
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            misc.save_model(
-                args=args, model_without_ddp=model_without_ddp,
-                optimizer=optimizer, epoch=epoch, epoch_name="best",
-                scaler=scaler,
-            )
-            print(f"New best model saved (val_loss={best_val_loss:.4f})")
-
-        if misc.is_main_process() and log_writer is not None:
-            log_writer.flush()
+            _save_checkpoint(accelerator, args, epoch, "best")
+            accelerator.print(f"New best model saved (val_loss={best_val_loss:.4f})")
 
     total_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))
-    print(f"Training completed! Total time: {total_time}")
+    accelerator.print(f"Training completed! Total time: {total_time}")
 
-    if log_writer is not None:
-        log_writer.close()
+    if args.use_tensorboard:
+        accelerator.end_training()
 
 
 if __name__ == '__main__':

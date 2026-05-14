@@ -6,5 +6,9 @@ pillow>=9.0.0
 tensorboard>=2.12.0
 scipy>=1.10.0
 
+# 训练加速 / 分布式：DDP + AMP + GradScaler + 梯度累积统一封装
+# 0.25+ 才支持 ProjectConfiguration 的 automatic_checkpoint_naming 参数
+accelerate>=0.25.0
+
 # T2I 扩展依赖（仅当 cond_type=text / dataset_type=text_image 时需要）
 transformers>=4.30.0
