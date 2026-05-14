@@ -1,0 +1,105 @@
+# ============================================================================
+# COCO Text-to-Image 训练配置
+# ----------------------------------------------------------------------------
+# 启动方式与原配置相同：
+#   python train.py --config configs/coco_t2i.yaml
+#   torchrun --nproc_per_node=8 train.py --config configs/coco_t2i.yaml
+#
+# 数据准备（推荐 COCO 2017）：
+#   data_root/
+#       train2017/                    # 图像
+#       val2017/
+#       annotations/captions_train2017.json
+#       annotations/captions_val2017.json
+# 也可以用 CSV / JSONL 自定义图文对，参考 dataset/text_image_dataset.py 注释。
+# ============================================================================
+
+model:
+  name: "alignment_vae"
+  input_size: 256
+  latent_dim: 64
+  image_channels: 3
+
+  # ── VAE（与 ImageNet 配置完全一致） ────────────────────────
+  vae_variant: "VAE-H"
+  ch: 128
+  ch_mult: [1, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+  double_z: true
+
+  # ── T2I 关键开关 ────────────────────────────────────────
+  # 'label' (默认；EmbeddingLabelEncoder) | 'text' (T2I)
+  cond_type: "text"
+
+  # 文本编码器（HF 仓库名或本地路径）
+  #   clip / clip-large / t5-small / t5-base 已内置快捷别名
+  #   也可直接填 HF 路径，如 "openai/clip-vit-large-patch14"
+  text_encoder_name: "clip"
+  text_encoder_pretrained: null         # 优先级高于 text_encoder_name
+  text_encoder_freeze: true             # 冻结 text encoder（推荐）
+  max_text_len: 77                      # 与 CLIP 一致；T5 可设为 64/128
+
+  # SpatialTextEncoder 主干变体
+  text_encoder_variant: "STE-B"         # STE-B | STE-L | STE-H
+
+  # 标签编码器初始 logsigma（对 T2I 同样生效）
+  label_init_logsigma: 0.0
+
+  num_classes: 1                        # 占位：T2I 模式不会使用
+
+training:
+  # ── 数据集 ─────────────────────────────────────────────
+  dataset_type: "text_image"            # 'imagenet' (默认) | 'text_image'
+  dataset_format: "auto"                # auto | coco | csv | jsonl
+  data_root: "/path/to/coco"            # ⚠️ 修改为本地 COCO 路径
+  dataset: "coco_captions"              # 仅作日志标识
+
+  # ── 批/学习率 ──────────────────────────────────────────
+  batch_size: 16
+  accum_iter: 4
+  num_workers: 8
+  epochs: 50
+  lr: 1.0e-4
+  lr_label_encoder: 1.0e-4
+  lr_schedule: "cosine"
+  warmup_epochs: 2
+  min_lr: 0.0
+
+  # ── 损失权重 ──────────────────────────────────────────
+  weight_recon: 1.0
+  weight_alignment: 1.0
+  weight_alignment_reverse: 0.1
+  alignment_temp: 1.0
+
+  # ── 优化 ──────────────────────────────────────────────
+  grad_clip: 1.0
+  use_amp: true
+  use_compile: false
+
+  # ── 日志/保存 ─────────────────────────────────────────
+  log_interval: 100
+  save_interval: 5
+
+  # ── 评估 ──────────────────────────────────────────────
+  # T2I 模式下 generate_from_label() 实际是 generate_from_text()，
+  # 计算的 Gen FID 即为 zero-shot COCO FID（标准 T2I 评测指标）。
+  compute_fid: true
+  fid_num_samples: 10000
+
+optimizer:
+  type: "adamw"
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+
+scheduler:
+  type: "cosine"
+  warmup_type: "linear"
+
+logging:
+  level: "INFO"
+  log_file: "./logs/coco_t2i.log"
+  use_tensorboard: true
+  tensorboard_dir: "./logs/coco_t2i_tb"
+  use_wandb: false
+  wandb_project: "alignment-vae-t2i"

@@ -1,14 +1,15 @@
 """
 Training script for AlignmentVAE — single-machine multi-GPU (DDP).
 
-    Image → VAE Encoder          → N(μ, σ²)  [B, h, w, D]
-    Label → SpatialLabelEncoder  → N(μ, σ²)  [B, h, w, D]
+    Image → VAE Encoder              → N(μ, σ²)  [B, h, w, D]
+    Label → EmbeddingLabelEncoder    → N(μ, σ²)  [B, h, w, D]   (cond_type='label')
+    Text  → SpatialTextEncoder       → N(μ, σ²)  [B, h, w, D]   (cond_type='text')
 
 Loss = MSE recon + VAE KL + Alignment KL + Label entropy
 
 Usage:
-    python train.py --config configs/default.yaml
-    torchrun --nproc_per_node=4 train.py --config configs/default.yaml
+    python train.py --config configs/imagenet_l2i.yaml
+    torchrun --nproc_per_node=4 train.py --config configs/imagenet_l2i.yaml
 """
 
 import argparse
@@ -33,16 +34,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 from torch.amp import GradScaler, autocast
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-from torchvision import transforms, datasets
+from torchvision import transforms
 
 from model import AlignmentVAE
+from model.label_encoder import EmbeddingLabelEncoder
 from model.text_encoder import (
-    SpatialLabelEncoder, SpatialLabelEncoder_models,
-    EmbeddingLabelEncoder,
+    SpatialTextEncoder, SpatialTextEncoder_models, TextEncoderWrapper,
 )
 from model.vae import VAE, VAE_models
+from dataset import ImageLabelDataset
 
 import util.misc as misc
 import util.lr_sched as lr_sched
@@ -56,15 +58,13 @@ def get_args_parser():
     parser = argparse.ArgumentParser('AlignmentVAE Training', add_help=True)
 
     # config file
-    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    parser.add_argument('--config', type=str, default='configs/imagenet_l2i.yaml')
 
     # architecture overrides
     parser.add_argument('--input_size', type=int, default=None)
     parser.add_argument('--latent_dim', type=int, default=None)
     parser.add_argument('--vae_variant', type=str, default=None,
                         help='VAE-B | VAE-L | VAE-H')
-    parser.add_argument('--label_encoder_variant', type=str, default=None,
-                        help='SLE-B | SLE-L | SLE-H')
     parser.add_argument('--num_classes', type=int, default=None)
 
     # training
@@ -93,6 +93,11 @@ def get_args_parser():
                         help='Enable AMP (automatic mixed precision) training')
     parser.add_argument('--no_amp', action='store_false', dest='use_amp',
                         help='Disable AMP training')
+    parser.add_argument('--amp_dtype', type=str, default="bf16",
+                        choices=['fp16', 'bf16', 'fp32'],
+                        help='AMP autocast dtype. fp16 (default, needs GradScaler) | '
+                             'bf16 (Ampere/Hopper, no GradScaler, more numerically stable) | '
+                             'fp32 (disable AMP). Overrides yaml `amp_dtype`.')
     parser.add_argument('--use_compile', action='store_true', default=False,
                         help='Enable torch.compile for model optimization (PyTorch 2.0+)')
 
@@ -129,8 +134,6 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.input_size = args.input_size or model_cfg.get('input_size', 256)
     args.latent_dim = args.latent_dim or model_cfg.get('latent_dim', 16)
     args.vae_variant = args.vae_variant or model_cfg.get('vae_variant', 'VAE-B')
-    args.label_encoder_variant = (args.label_encoder_variant
-                                  or model_cfg.get('label_encoder_variant', 'SLE-B'))
     args.num_classes = args.num_classes or model_cfg.get('num_classes', 1000)
     args.image_channels = model_cfg.get('image_channels', 3)
     args.ch = model_cfg.get('ch', 128)
@@ -139,12 +142,21 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.attn_resolutions = model_cfg.get('attn_resolutions', [16])
     args.double_z = model_cfg.get('double_z', True)
     args.label_init_logsigma = model_cfg.get('label_init_logsigma', -2.0)
-    # 新增：是否绕过 Transformer，直接用 nn.Embedding 把 label 映射到高斯参数。
-    # 该开关优先级高于 label_encoder_variant —— 一旦开启，无论指定何种变体，
-    # 标签编码器一律构建为 EmbeddingLabelEncoder（用于消融 / 快速 baseline）。
-    args.use_embedding_label_encoder = bool(
-        model_cfg.get('use_embedding_label_encoder', False)
-    )
+
+    # ── 条件编码器选择 ────────────────────────────────────────
+    # cond_type:
+    #   'label' → EmbeddingLabelEncoder              (默认；ImageNet 等离散类条件)
+    #   'text'  → TextEncoderWrapper + SpatialTextEncoder (COCO/CC3M T2I)
+    args.cond_type = model_cfg.get('cond_type', 'label')
+    assert args.cond_type in ('label', 'text'), \
+        f"cond_type must be one of 'label' | 'text', got {args.cond_type!r}"
+
+    # ── T2I 扩展配置（仅 cond_type='text' 时生效） ───────────
+    args.text_encoder_name = model_cfg.get('text_encoder_name', 'clip')
+    args.text_encoder_pretrained = model_cfg.get('text_encoder_pretrained', None)
+    args.text_encoder_freeze = bool(model_cfg.get('text_encoder_freeze', True))
+    args.max_text_len = int(model_cfg.get('max_text_len', 77))
+    args.text_encoder_variant = model_cfg.get('text_encoder_variant', 'STE-B')
 
     # Training
     args.epochs = args.epochs or train_cfg.get('epochs', 100)
@@ -172,6 +184,9 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
 
     # Dataset
     args.data_path = args.data_path or train_cfg.get('data_root', './data/imagenet')
+    # dataset_type: 'imagenet' (旧) | 'text_image' (新)
+    args.dataset_type = train_cfg.get('dataset_type', 'imagenet')
+    args.dataset_format = train_cfg.get('dataset_format', 'auto')   # coco | csv | jsonl | auto
 
     # Workers / logging
     args.num_workers = (args.num_workers if args.num_workers is not None
@@ -191,6 +206,15 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
         args.use_amp = train_cfg.get('use_amp', True)
     if not hasattr(args, 'use_compile') or args.use_compile is False:
         args.use_compile = train_cfg.get('use_compile', False)
+
+    # AMP dtype: CLI > YAML > default('fp16'); 'fp32' implies use_amp=False
+    cli_amp_dtype = getattr(args, 'amp_dtype', None)
+    yaml_amp_dtype = train_cfg.get('amp_dtype', None)
+    args.amp_dtype = (cli_amp_dtype or yaml_amp_dtype or 'fp16').lower()
+    assert args.amp_dtype in ('fp16', 'bf16', 'fp32'), \
+        f"amp_dtype must be 'fp16' | 'bf16' | 'fp32', got {args.amp_dtype!r}"
+    if args.amp_dtype == 'fp32':
+        args.use_amp = False
 
     args.yaml_config = cfg
     return args
@@ -367,42 +391,29 @@ class MetricsComputer:
 
 
 # ============================================================================
-# Dataset
+# Batch helpers — 统一处理 (image, label) 与 dict-batch 两种格式
 # ============================================================================
 
-class ImageLabelDataset(Dataset):
-    """ImageNet or dummy (image, label) dataset."""
+def _unpack_batch(batch):
+    """
+    返回 (images, cond)
+      - 旧格式 (image, label) tuple/list → cond 为 LongTensor[B]
+      - 新格式 dict {image, input_ids, attention_mask} → cond 为 dict
+    """
+    if isinstance(batch, dict):
+        image = batch["image"]
+        cond = {k: v for k, v in batch.items() if k != "image"}
+        return image, cond
+    # tuple / list
+    return batch[0], batch[1]
 
-    def __init__(self, root: str, split: str = "train", transform=None,
-                 num_classes: int = 1000, max_samples: Optional[int] = None):
-        self.num_classes = num_classes
-        self.transform = transform or transforms.Compose([
-            transforms.Resize(256), transforms.CenterCrop(256), transforms.ToTensor(),
-        ])
 
-        imagenet_path = os.path.join(root, split)
-        if os.path.isdir(imagenet_path):
-            try:
-                self.dataset = datasets.ImageFolder(imagenet_path, transform=self.transform)
-                self.use_real = True
-                if max_samples and max_samples < len(self.dataset):
-                    self.dataset = torch.utils.data.Subset(
-                        self.dataset, list(range(max_samples))
-                    )
-            except Exception:
-                self.use_real = False
-                self.length = max_samples or 1000
-        else:
-            self.use_real = False
-            self.length = max_samples or 1000
-
-    def __len__(self) -> int:
-        return len(self.dataset) if self.use_real else self.length
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        if self.use_real:
-            return self.dataset[idx]
-        return torch.rand(3, 256, 256), idx % self.num_classes
+def _cond_to_device(cond, device):
+    """把 cond 中的所有 tensor 搬到 device。"""
+    if isinstance(cond, dict):
+        return {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)
+                for k, v in cond.items()}
+    return cond.to(device, non_blocking=True)
 
 
 # ============================================================================
@@ -435,36 +446,50 @@ def build_model(args) -> AlignmentVAE:
             double_z=args.double_z,
         )
 
-    # Label encoder
-    # 当 use_embedding_label_encoder 开启时：跳过 Transformer 构建，
-    # 直接使用 EmbeddingLabelEncoder（label → nn.Embedding → 高斯参数）。
-    if getattr(args, 'use_embedding_label_encoder', False):
-        sle_variant = 'SLE-E (embed)'
+    # ── Conditioning encoder ─────────────────────────────────────────────────
+    cond_type = getattr(args, 'cond_type', 'label')
+
+    if cond_type == 'text':
+        # —— T2I 模式：HF 文本编码器 + SpatialTextEncoder ——
+        text_encoder_wrapper = TextEncoderWrapper(
+            model_name=args.text_encoder_name,
+            pretrained_path=args.text_encoder_pretrained,
+            freeze=args.text_encoder_freeze,
+        )
+        text_dim = text_encoder_wrapper.hidden_dim
+
+        ste_variant = args.text_encoder_variant
+        if ste_variant in SpatialTextEncoder_models:
+            label_encoder = SpatialTextEncoder_models[ste_variant](
+                input_size=args.input_size, latent_dim=args.latent_dim,
+                text_dim=text_dim, max_text_len=args.max_text_len,
+                text_encoder=text_encoder_wrapper,
+                init_logsigma=args.label_init_logsigma,
+            )
+        else:
+            model_cfg = args.yaml_config.get('model', {})
+            label_encoder = SpatialTextEncoder(
+                input_size=args.input_size, patch_size=16,
+                text_dim=text_dim, max_text_len=args.max_text_len,
+                text_encoder=text_encoder_wrapper,
+                hidden_size=model_cfg.get('text_hidden_size', 768),
+                latent_dim=args.latent_dim,
+                depth=model_cfg.get('text_depth', 12),
+                num_heads=model_cfg.get('text_num_heads', 12),
+                mlp_ratio=model_cfg.get('text_mlp_ratio', 4.0),
+                in_context_start=model_cfg.get('text_in_context_start', 4),
+                init_logsigma=args.label_init_logsigma,
+            )
+        sle_variant = f"{ste_variant} ({args.text_encoder_name})"
+
+    else:
+        # —— Label 模式：EmbeddingLabelEncoder（轻量、无 Transformer） ——
+        sle_variant = 'EmbedLabel'
         label_encoder = EmbeddingLabelEncoder(
             input_size=args.input_size, patch_size=16,
             num_classes=args.num_classes, latent_dim=args.latent_dim,
             init_logsigma=args.label_init_logsigma,
         )
-    else:
-        sle_variant = args.label_encoder_variant
-        if sle_variant in SpatialLabelEncoder_models:
-            label_encoder = SpatialLabelEncoder_models[sle_variant](
-                input_size=args.input_size, num_classes=args.num_classes,
-                latent_dim=args.latent_dim, init_logsigma=args.label_init_logsigma,
-            )
-        else:
-            model_cfg = args.yaml_config.get('model', {})
-            label_encoder = SpatialLabelEncoder(
-                input_size=args.input_size, patch_size=16,
-                num_classes=args.num_classes, latent_dim=args.latent_dim,
-                hidden_size=model_cfg.get('label_hidden_size', 768),
-                depth=model_cfg.get('label_depth', 12),
-                num_heads=model_cfg.get('label_num_heads', 12),
-                mlp_ratio=model_cfg.get('label_mlp_ratio', 4.0),
-                in_context_len=model_cfg.get('label_in_context_len', 32),
-                in_context_start=model_cfg.get('label_in_context_start', 4),
-                init_logsigma=args.label_init_logsigma,
-            )
 
     # Assemble
     model = AlignmentVAE(
@@ -517,6 +542,7 @@ def train_one_epoch(
     scaler: Optional[GradScaler] = None,
     log_writer=None,
     args=None,
+    amp_dtype: torch.dtype = torch.float16,
 ):
     """Train for one epoch with AMP, per-iteration LR scheduling and gradient accumulation."""
     model.train()
@@ -532,14 +558,16 @@ def train_one_epoch(
     # backward accumulates directly into buckets — avoids cuDNN channels_last stride mismatch.
     optimizer.zero_grad()
 
-    for step, (images, labels) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    for step, batch in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        images, cond = _unpack_batch(batch)
+
         # Only adjust LR at the boundary of each accumulation window
         if step % accum_iter == 0:
             fractional_epoch = step / len(data_loader) + epoch
             lr_sched.adjust_learning_rate(optimizer, fractional_epoch, args)
 
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        cond = _cond_to_device(cond, device)
 
         # Use no_sync context for non-update steps in DDP to avoid redundant all-reduce
         if accum_iter > 1 and hasattr(model, 'no_sync'):
@@ -548,8 +576,8 @@ def train_one_epoch(
             sync_ctx = nullcontext
 
         with sync_ctx():
-            with autocast('cuda', enabled=use_amp):
-                x_recon, loss, metrics = model(images, labels)
+            with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                x_recon, loss, metrics = model(images, cond)
                 loss = loss / accum_iter  # Normalize loss by accumulation steps
 
         loss_value = loss.item() * accum_iter  # Un-scale for logging (show true per-sample loss)
@@ -615,6 +643,7 @@ def evaluate(
     fid_num_samples: int = 10000,
     header: str = "Val:",
     use_amp: bool = True,
+    amp_dtype: torch.dtype = torch.float16,
 ):
     """Evaluate: loss, MSE, PSNR, SSIM, recon/gen FID."""
     model.eval()
@@ -626,12 +655,13 @@ def evaluate(
 
     model_unwrapped = model.module if hasattr(model, 'module') else model
 
-    for images, labels in metric_logger.log_every(data_loader, 50, header):
+    for batch in metric_logger.log_every(data_loader, 50, header):
+        images, cond = _unpack_batch(batch)
         images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        cond = _cond_to_device(cond, device)
 
-        with autocast('cuda', enabled=use_amp):
-            x_recon, loss, metrics = model(images, labels)
+        with autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+            x_recon, loss, metrics = model(images, cond)
 
         # Cast back to float32 for metric computation
         x_recon = x_recon.float()
@@ -653,7 +683,7 @@ def evaluate(
             feats_real_list.append(metrics_computer.extract_inception_features(images))
             feats_recon_list.append(metrics_computer.extract_inception_features(x_recon))
             if compute_fid:
-                x_gen = model_unwrapped.generate_from_label(labels)
+                x_gen = model_unwrapped.generate_from_label(cond)
                 feats_gen_list.append(metrics_computer.extract_inception_features(x_gen))
             fid_samples_collected += images.shape[0]
 
@@ -726,12 +756,18 @@ def _print_config(args):
     print("  Configuration")
     print(sep)
 
-    use_embed = getattr(args, 'use_embedding_label_encoder', False)
+    cond_type = getattr(args, 'cond_type', 'label')
+    if cond_type == 'text':
+        cond_encoder_str = f"{getattr(args, 'text_encoder_variant', 'STE-B')} " \
+                           f"({getattr(args, 'text_encoder_name', 'clip')}, " \
+                           f"frozen={getattr(args, 'text_encoder_freeze', True)})"
+    else:
+        cond_encoder_str = "EmbeddingLabelEncoder"
+
     _section("Model", [
         ("vae_variant",           str(getattr(args, 'vae_variant', 'VAE-B'))),
-        ("label_encoder_variant", str(getattr(args, 'label_encoder_variant', 'SLE-B'))
-                                  + ("  (overridden by embedding-only)" if use_embed else "")),
-        ("use_embedding_label_encoder", str(use_embed)),
+        ("cond_type",             cond_type),
+        ("cond_encoder",          cond_encoder_str),
         ("input_size",            str(args.input_size)),
         ("latent_dim",            str(args.latent_dim)),
         ("image_channels",        str(args.image_channels)),
@@ -770,6 +806,7 @@ def _print_config(args):
         ("distributed",         str(getattr(args, 'distributed', False))),
         ("device",              str(args.device)),
         ("use_amp",             str(getattr(args, 'use_amp', True))),
+        ("amp_dtype",           str(getattr(args, 'amp_dtype', 'fp16'))),
         ("use_compile",         str(getattr(args, 'use_compile', False))),
     ])
 
@@ -801,6 +838,26 @@ def main(args):
     # AMP / torch.compile flags
     use_amp = getattr(args, 'use_amp', True) and device.type == 'cuda'
     use_compile = getattr(args, 'use_compile', False)
+
+    # Resolve AMP autocast dtype (fp16 | bf16 | fp32).
+    #   - fp16: needs GradScaler to avoid gradient underflow
+    #   - bf16: same exponent range as fp32, no GradScaler required, much
+    #           more numerically stable for KL/exp/log heavy losses
+    #   - fp32: AMP fully disabled
+    amp_dtype_str = getattr(args, 'amp_dtype', 'fp16')
+    if amp_dtype_str == 'bf16':
+        amp_dtype = torch.bfloat16
+    elif amp_dtype_str == 'fp16':
+        amp_dtype = torch.float16
+    else:
+        amp_dtype = torch.float32
+    # Warn & fall back if hardware lacks native bf16 support (e.g. V100/T4)
+    if use_amp and amp_dtype == torch.bfloat16 and torch.cuda.is_available():
+        if not torch.cuda.is_bf16_supported():
+            print("[WARN] amp_dtype='bf16' requested but current CUDA device "
+                  "does NOT natively support bfloat16. Falling back to fp16.")
+            amp_dtype = torch.float16
+    use_grad_scaler = use_amp and (amp_dtype == torch.float16)
 
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -842,16 +899,40 @@ def main(args):
         transforms.Normalize(mean=list(imagenet_mean), std=list(imagenet_std)),
     ])
 
-    train_dataset = ImageLabelDataset(
-        root=args.data_path, split="train",
-        transform=transform_train, num_classes=args.num_classes,
-    )
-    val_dataset = ImageLabelDataset(
-        root=args.data_path, split="val",
-        transform=transform_val, num_classes=args.num_classes,
-    )
+    if getattr(args, 'dataset_type', 'imagenet') == 'text_image':
+        # —— T2I: COCO Captions / CC3M / 自定义图文对 ——
+        from dataset import build_text_image_dataset
+        # 复用 text encoder 同源 tokenizer
+        from transformers import AutoTokenizer
+        tokenizer_path = (
+            args.text_encoder_pretrained
+            or TextEncoderWrapper.SUPPORTED.get(args.text_encoder_name, args.text_encoder_name)
+        )
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
-    print(f"Dataset: train={len(train_dataset)}, val={len(val_dataset)}")
+        train_dataset = build_text_image_dataset(
+            root=args.data_path, split="train", tokenizer=tokenizer,
+            format=args.dataset_format, max_text_len=args.max_text_len,
+            input_size=args.input_size,
+        )
+        val_dataset = build_text_image_dataset(
+            root=args.data_path, split="val", tokenizer=tokenizer,
+            format=args.dataset_format, max_text_len=args.max_text_len,
+            input_size=args.input_size,
+        )
+    else:
+        # —— 原 ImageNet 流程 ——
+        train_dataset = ImageLabelDataset(
+            root=args.data_path, split="train",
+            transform=transform_train, num_classes=args.num_classes,
+        )
+        val_dataset = ImageLabelDataset(
+            root=args.data_path, split="val",
+            transform=transform_val, num_classes=args.num_classes,
+        )
+
+    print(f"Dataset: train={len(train_dataset)}, val={len(val_dataset)} "
+          f"[type={getattr(args, 'dataset_type', 'imagenet')}]")
 
     # Samplers
     if args.distributed:
@@ -897,19 +978,26 @@ def main(args):
         fused_available = False
     use_fused = fused_available and device.type == 'cuda'
     extra_optim_kwargs = {'fused': True} if use_fused else {}
+    # 仅把 requires_grad=True 的参数交给优化器
+    # （T2I 模式下文本编码器通常 frozen，避免 AdamW 为其分配 state）
     optimizer = torch.optim.AdamW([
-        {'params': model_without_ddp.vae.parameters(), 'lr': args.lr},
-        {'params': model_without_ddp.label_encoder.parameters(),
+        {'params': [p for p in model_without_ddp.vae.parameters() if p.requires_grad],
+         'lr': args.lr},
+        {'params': [p for p in model_without_ddp.label_encoder.parameters() if p.requires_grad],
          'lr': args.lr, 'lr_scale': lr_scale_label},
     ], weight_decay=args.weight_decay, betas=(0.9, 0.999),
        **extra_optim_kwargs)
     if use_fused:
         print("Using fused AdamW optimizer (CUDA-accelerated)")
 
-    # AMP GradScaler
-    scaler = GradScaler('cuda', enabled=use_amp) if use_amp else None
+    # AMP GradScaler — only fp16 needs grad scaling; bf16 has fp32-equivalent
+    # range so its gradients won't underflow.
+    scaler = GradScaler('cuda', enabled=use_grad_scaler) if use_grad_scaler else None
     if use_amp:
-        print("Using AMP (automatic mixed precision) training")
+        print(f"Using AMP (automatic mixed precision): "
+              f"dtype={amp_dtype_str}, GradScaler={'on' if use_grad_scaler else 'off'}")
+    else:
+        print("AMP disabled (training in fp32)")
 
     # Metrics
     # Pass the same (mean, std) used by transform_{train,val} so PSNR can
@@ -959,6 +1047,7 @@ def main(args):
             scaler=scaler,
             log_writer=log_writer,
             args=args,
+            amp_dtype=amp_dtype,
         )
 
         val_stats = evaluate(
@@ -967,6 +1056,7 @@ def main(args):
             fid_num_samples=args.fid_num_samples,
             header="Val:",
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
         )
 
         # TensorBoard logging

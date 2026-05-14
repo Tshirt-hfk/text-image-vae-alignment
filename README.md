@@ -1,10 +1,14 @@
 # Text-Image VAE Spatial Alignment
 
-将图像和类别标签编码到**同一空间高斯潜空间** `[B, H/16, W/16, D]`，通过 KL 散度对齐两者的分布，从而支持：
+将图像和**条件输入（类别标签 / 自然语言 caption）**编码到**同一空间高斯潜空间** `[B, H/16, W/16, D]`，通过 KL 散度对齐两者的分布，从而支持：
 
-- **从标签条件生成图像**：标签 → 高斯参数 → 采样 → 解码
+- **条件生成**：标签 / caption → 高斯参数 → 采样 → 解码
 - **图像重建**：图像 → VAE 潜变量 → 解码
-- **标签间插值生成**：在两个标签的高斯分布间线性插值后解码
+- **条件间插值生成**：在两个条件的高斯分布间线性插值后解码
+
+> 项目支持两套训练流程，通过配置开关无缝切换：
+> - **Label 模式（默认）**：ImageNet 1000 类条件 → 图像
+> - **Text 模式（T2I）**：COCO Captions / CC3M 等图文对 → 真正的文生图
 
 ## 架构总览
 
@@ -13,7 +17,7 @@
 Image (RGB)  ──► VAE Encoder (4× ↓2 conv)  ──►  N(μ_img,   σ_img²)  │
                                             │   [B, h, w, D]        │
                                             ├───── KL 对齐 ─────────┤
-Label (int)  ──► Spatial Label Encoder ────►  N(μ_label, σ_label²)  │
+Label (int)  ──► Embedding Label Encoder ──►  N(μ_label, σ_label²)  │
                                             └─────────┬─────────────┘
                                                       │
                                 z = μ_img + σ_img · ε │ (重参数化)
@@ -28,9 +32,9 @@ Loss = w_recon · MSE(x, x̂)
 ### 核心组件
 
 - [`VAE`](model/vae.py:246-287)：Flux2 风格的 4 级 Conv2d 下采样 / 上采样（共 16× 压缩），ResBlock + 可选 [`AttnBlock`](model/vae.py:44-70)（基于 PyTorch SDPA / FlashAttention），中间层 `Res-Attn-Res` 瓶颈。Encoder 输出 `[B, h, w, D]` 的对角高斯 `(μ, logσ)` 并重参数化采样 `z = μ + σ·ε`。
-- [`SpatialLabelEncoder`](model/text_encoder.py:112-228)：基于 [`AdaLNBlock`](model/text_encoder.py:87-105)（adaLN 调制 + 2D-RoPE + SwiGLU FFN + RMSNorm + QK-norm）的 Transformer。可学习空间 token 叠加固定 2D sin-cos 位置编码后，从第 `in_context_start` 层起注入若干 in-context label token，最终输出空间高斯分布。
-- [`EmbeddingLabelEncoder`](model/text_encoder.py:235-290)：**消融基线**，跳过 Transformer，直接用 `nn.Embedding` 把 label 映射到每个空间位置的 `(μ, logσ)`，用于验证「对齐 KL」是否真的需要表达力强的标签编码器。
-- [`AlignmentVAE`](model/alignment_vae.py:13-187)：组合模型，封装训练 forward 与多种推理接口。
+- [`EmbeddingLabelEncoder`](model/label_encoder.py)：**Label 模式默认编码器**。直接用两张 `nn.Embedding` 表把 int label 映射到每个空间位置的 `(μ, logσ)`，无 Transformer，参数量小、训练快。
+- [`SpatialTextEncoder`](model/text_encoder.py) + [`TextEncoderWrapper`](model/text_encoder.py)：**T2I 模式**。基于 [`AdaLNBlock`](model/text_encoder.py)（adaLN 调制 + 2D-RoPE + SwiGLU FFN + RMSNorm + QK-norm）的 Transformer 主干，配合 HuggingFace CLIP / T5 文本编码器，把 caption 编码为同形状的空间高斯分布。
+- [`AlignmentVAE`](model/alignment_vae.py)：组合模型，封装训练 forward 与多种推理接口。
 - [`GaussianAlignmentLoss`](losses/alignment_loss.py:15-78)：可单独使用的 KL 对齐损失模块（支持双向、温度缩放）。
 
 ### 预设变体
@@ -43,16 +47,24 @@ Loss = w_recon · MSE(x, x̂)
 | VAE-L | 192 | [1,2,4,4] | 2 | {32, 16} |
 | VAE-H | 256 | [1,2,4,4] | 3 | {32, 16} |
 
-**Spatial Label Encoder**（[`SpatialLabelEncoder_models`](model/text_encoder.py:329-334)）
+**条件编码器**（通过 `cond_type` 选择）
+
+| `cond_type` | 编码器 | 适用场景 |
+|------|------|------|
+| `label`（默认） | [`EmbeddingLabelEncoder`](model/label_encoder.py) | 离散类条件（ImageNet 等） |
+| `text` | [`TextEncoderWrapper`](model/text_encoder.py) + [`SpatialTextEncoder`](model/text_encoder.py) | 自然语言 caption（COCO / CC3M 等） |
+
+**Spatial Text Encoder（T2I 模式）**（[`SpatialTextEncoder_models`](model/text_encoder.py)）
 
 | 变体 | 深度 | 隐层维度 | 注意力头数 | in-context 注入起始层 |
 |------|:---:|:---:|:---:|:---:|
-| SLE-B | 6  | 768  | 12 | 4  |
-| SLE-L | 12 | 1024 | 16 | 8  |
-| SLE-H | 16 | 1280 | 16 | 10 |
-| SLE-E | —  | —    | —  | — *（embedding-only baseline）* |
+| STE-B | 6  | 768  | 12 | 4  |
+| STE-L | 12 | 1024 | 16 | 8  |
+| STE-H | 16 | 1280 | 16 | 10 |
 
-> 注：当 `use_embedding_label_encoder=true` 时，会强制使用 `EmbeddingLabelEncoder`，该开关优先级高于 `label_encoder_variant`。
+T2I 模式下，由 [`TextEncoderWrapper`](model/text_encoder.py) 加载 HuggingFace 预训练文本编码器（CLIP / T5），输出 `(seq_features, pooled, mask)`：
+- `pooled` → AdaLN conditioning `c`
+- `seq_features` → in-context tokens（替代 broadcasted label）
 
 ## 损失函数
 
@@ -81,10 +93,11 @@ pip install -r requirements.txt
 ```
 
 依赖：`torch>=2.0`、`torchvision>=0.15`、`tensorboard`、`scipy`、`pyyaml`、`pillow`、`tqdm`。
+T2I 模式额外需要 `transformers>=4.30`（用于加载 HF 文本编码器）。
 
 ### 数据准备
 
-预期 ImageNet 风格目录结构：
+#### 1) Label 模式（ImageNet）
 
 ```
 data_root/
@@ -92,25 +105,50 @@ data_root/
 └── val/<class_name>/*.jpg
 ```
 
-通过 [`ImageLabelDataset`](train.py:314-346) 加载；若指定路径不存在，会自动回退到随机张量的 dummy 数据集（便于快速 smoke test）。训练数据采用 `Resize(1.1×) + RandomCrop + RandomHFlip + ImageNet Normalize`。
+通过 [`ImageLabelDataset`](dataset/label_image_dataset.py) 加载；若指定路径不存在，会自动回退到随机张量的 dummy 数据集（便于快速 smoke test）。
+
+#### 2) Text 模式（T2I）
+
+由 [`TextImageDataset`](dataset/text_image_dataset.py) 自动探测以下三种格式：
+
+**COCO Captions（推荐）**
+```
+data_root/
+├── train2017/                                  # 图像
+├── val2017/
+└── annotations/
+    ├── captions_train2017.json
+    └── captions_val2017.json
+```
+
+**通用 CSV / JSONL（适合 CC3M / CC12M / 自定义）**
+- `train.csv` / `val.csv`：每行 `image_path,caption`（首行可为表头）
+- `train.jsonl` / `val.jsonl`：每行 `{"image": "...", "caption": "..."}`
+
+数据路径不存在时同样回退到 dummy 模式。
 
 ### 单机训练
 
 ```bash
-python train.py --config configs/default.yaml
+# Label 模式（ImageNet）
+python train.py --config configs/imagenet_l2i.yaml
+
+# Text 模式（COCO T2I），先在 configs/coco_t2i.yaml 中改 data_root
+python train.py --config configs/coco_t2i.yaml
 ```
 
 ### 单机多卡（DDP）
 
 ```bash
-torchrun --nproc_per_node=8 train.py --config configs/default.yaml
+torchrun --nproc_per_node=8 train.py --config configs/imagenet_l2i.yaml
+torchrun --nproc_per_node=8 train.py --config configs/coco_t2i.yaml
 ```
 
 ### 断点续训
 
 ```bash
 torchrun --nproc_per_node=8 train.py \
-    --config configs/default.yaml \
+    --config configs/imagenet_l2i.yaml \
     --resume ./output_dir
 ```
 
@@ -118,14 +156,13 @@ torchrun --nproc_per_node=8 train.py \
 
 ### 主要训练参数
 
-完整参数见 [`configs/default.yaml`](configs/default.yaml) 与 `python train.py --help`。常用参数：
+完整参数见 [`configs/imagenet_l2i.yaml`](configs/imagenet_l2i.yaml) 与 `python train.py --help`。常用参数：
 
 | 参数 | 默认值 | 说明 |
 |------|:---:|------|
 | `--input_size` | 256 | 输入图像分辨率 |
 | `--latent_dim` | 64 | 潜空间通道数 D |
 | `--vae_variant` | `VAE-H` | `VAE-B` / `VAE-L` / `VAE-H` 或自定义 |
-| `--label_encoder_variant` | `SLE-B` | `SLE-B` / `SLE-L` / `SLE-H` / `SLE-E` |
 | `--num_classes` | 1000 | 类别数（默认 ImageNet） |
 | `--batch_size` | 64 | 每 GPU 批大小 |
 | `--accum_iter` | 2 | 梯度累积步数（有效 batch = `batch × accum × world`） |
@@ -143,38 +180,82 @@ torchrun --nproc_per_node=8 train.py \
 
 ### 推理示例
 
+#### Label 模式（ImageNet）
+
 ```python
 import torch
 from model import AlignmentVAE
 from model.vae import VAE_H
-from model.text_encoder import SpatialLabelEncoder_B
+from model.label_encoder import EmbeddingLabelEncoder
 
-# 1) 构建模型（参数需与训练时一致）
 vae = VAE_H(latent_dim=64, resolution=256)
-label_encoder = SpatialLabelEncoder_B(input_size=256, num_classes=1000, latent_dim=64)
+label_encoder = EmbeddingLabelEncoder(
+    input_size=256, num_classes=1000, latent_dim=64,
+)
 model = AlignmentVAE(
     input_size=256, latent_dim=64, num_classes=1000,
     vae=vae, label_encoder=label_encoder,
 ).cuda().eval()
 
-# 2) 加载 checkpoint
 ckpt = torch.load("output_dir/checkpoint-best.pth", map_location="cpu")
 model.load_state_dict(ckpt["model"])
 
-# 3) 标签 → 图像生成
 labels = torch.tensor([5, 10, 42], device="cuda")
 images = model.generate_from_label(labels)         # [3, 3, 256, 256]
+```
 
-# 4) 图像重建（确定性：使用 μ 而非采样）
+#### Text 模式（T2I：caption → image）
+
+```python
+import torch
+from model import AlignmentVAE
+from model.vae import VAE_H
+from model.text_encoder import SpatialTextEncoder_B, TextEncoderWrapper
+from transformers import AutoTokenizer
+
+# 1) 构建文本编码器 + 标签编码器
+text_encoder = TextEncoderWrapper(model_name="clip", freeze=True)
+label_encoder = SpatialTextEncoder_B(
+    input_size=256, latent_dim=64,
+    text_dim=text_encoder.hidden_dim, max_text_len=77,
+    text_encoder=text_encoder,
+)
+vae = VAE_H(latent_dim=64, resolution=256)
+model = AlignmentVAE(
+    input_size=256, latent_dim=64, num_classes=1,   # T2I 不使用 num_classes
+    vae=vae, label_encoder=label_encoder,
+).cuda().eval()
+
+ckpt = torch.load("output_dir/checkpoint-best.pth", map_location="cpu")
+model.load_state_dict(ckpt["model"])
+
+# 2) tokenize caption（与训练时同源）
+tokenizer = AutoTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+captions = [
+    "a photo of a cat sitting on a sofa",
+    "a beautiful sunset over the ocean",
+]
+enc = tokenizer(captions, max_length=77, padding="max_length",
+                truncation=True, return_tensors="pt").to("cuda")
+cond = {"input_ids": enc["input_ids"], "attention_mask": enc["attention_mask"]}
+
+# 3) caption → image
+images = model.generate_from_label(cond)           # [2, 3, 256, 256]
+```
+
+#### 公共能力（两种模式通用）
+
+```python
+# 图像重建（确定性）
 x = torch.randn(2, 3, 256, 256, device="cuda")
 recon = model.reconstruct_image(x)
 
-# 5) 两个标签间的潜空间插值
-frames = model.label_interpolate(label1=5, label2=42, num_steps=8, device="cuda")
+# 拿到中间高斯分布
+mu_img, sigma_img = model.encode_image_to_gaussian(x)
+mu_cond, sigma_cond = model.encode_label_to_gaussian(cond_or_labels)
 
-# 6) 拿到中间高斯分布（用于诊断 / 下游任务）
-mu_img,  sigma_img  = model.encode_image_to_gaussian(x)
-mu_lbl,  sigma_lbl  = model.encode_label_to_gaussian(labels)
+# Label 模式专属：标签间插值
+# frames = model.label_interpolate(label1=5, label2=42, num_steps=8, device="cuda")
 ```
 
 ## 文件结构
@@ -183,17 +264,24 @@ mu_lbl,  sigma_lbl  = model.encode_label_to_gaussian(labels)
 .
 ├── model/
 │   ├── vae.py               # VAE Encoder/Decoder（Flux2 风格）+ VAE_B/L/H
-│   ├── text_encoder.py      # SpatialLabelEncoder + AdaLNBlock + EmbeddingLabelEncoder
-│   └── alignment_vae.py     # AlignmentVAE 组合模型（训练 forward + 推理接口）
+│   ├── label_encoder.py     # EmbeddingLabelEncoder（label 模式默认；nn.Embedding lookup）
+│   ├── text_encoder.py      # 文本条件编码器（text 模式 / T2I）：
+│   │                          - SpatialTextEncoder + TextEncoderWrapper
+│   │                          - AdaLNBlock / Attention / SwiGLUFFN（Transformer 组件）
+│   └── alignment_vae.py     # AlignmentVAE 组合模型（forward 接受 label / text dict）
+├── dataset/
+│   ├── label_image_dataset.py  # L2I 数据集（ImageNet ImageFolder / dummy）
+│   └── text_image_dataset.py   # T2I 数据集（COCO / CSV / JSONL / dummy）
 ├── losses/
-│   └── alignment_loss.py    # GaussianAlignmentLoss（可独立使用）
+│   └── alignment_loss.py    # GaussianAlignmentLoss
 ├── util/
 │   ├── misc.py              # 分布式工具（DDP 初始化、指标同步、checkpoint）
 │   ├── lr_sched.py          # Cosine / Constant 学习率 + 线性预热
 │   └── model_util.py        # RMSNorm、2D sin-cos PE、2D Vision RoPE
 ├── configs/
-│   └── default.yaml         # 默认训练配置
-├── train.py                 # 训练 / 评估入口（DDP + AMP + FID）
+│   ├── imagenet_l2i.yaml    # ImageNet 类别条件 L2I 配置（默认）
+│   └── coco_t2i.yaml        # COCO 文生图配置
+├── train.py                 # 训练入口（DDP + AMP + FID，自动适配 label / text）
 ├── requirements.txt
 └── README.md
 ```

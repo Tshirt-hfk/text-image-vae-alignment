@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .vae import VAE
-from .text_encoder import SpatialLabelEncoder
+from .label_encoder import EmbeddingLabelEncoder
 
 
 class AlignmentVAE(nn.Module):
@@ -27,12 +27,7 @@ class AlignmentVAE(nn.Module):
         attn_resolutions: Optional[List[int]] = None,
         double_z: bool = True,
         # Label encoder fallback params
-        label_hidden_size: int = 768,
-        label_depth: int = 12,
-        label_num_heads: int = 12,
-        label_mlp_ratio: float = 4.0,
-        label_in_context_len: int = 32,
-        label_in_context_start: int = 4,
+        label_init_logsigma: float = -2.0,
         # Loss weights
         weight_recon: float = 1.0,
         weight_alignment: float = 0.1,
@@ -65,30 +60,35 @@ class AlignmentVAE(nn.Module):
         if label_encoder is not None:
             self.label_encoder = label_encoder
         else:
-            self.label_encoder = SpatialLabelEncoder(
+            # Default: lightweight EmbeddingLabelEncoder（适用于 ImageNet 类条件）
+            # 若需要 T2I（caption → image），请显式传入 SpatialTextEncoder。
+            self.label_encoder = EmbeddingLabelEncoder(
                 input_size=input_size,
                 patch_size=self.patch_size,
                 num_classes=num_classes,
-                hidden_size=label_hidden_size,
                 latent_dim=latent_dim,
-                depth=label_depth,
-                num_heads=label_num_heads,
-                mlp_ratio=label_mlp_ratio,
-                in_context_len=label_in_context_len,
-                in_context_start=label_in_context_start,
+                init_logsigma=label_init_logsigma,
             )
 
     def forward(
         self,
         x: torch.Tensor,
-        labels: torch.Tensor,
+        cond,
         return_latents: bool = False,
     ) -> Union[
         Tuple[torch.Tensor, torch.Tensor, Dict],
         Tuple[torch.Tensor, torch.Tensor, Dict, Dict],
     ]:
+        """
+        Args:
+            x:    [B, 3, H, W]   image batch
+            cond: 任意条件输入，由 self.label_encoder 自行解析。
+                  - int label tensor [B]：EmbeddingLabelEncoder（ImageNet 等离散类条件）
+                  - dict {input_ids, attention_mask, ...}：SpatialTextEncoder（T2I）
+                  上层不感知具体类型，便于无缝切换 ImageNet / COCO / CC3M。
+        """
         z, mu_img, logsigma_img = self.vae.encoder(x)
-        mu_label, logsigma_label = self.label_encoder(labels)
+        mu_label, logsigma_label = self.label_encoder(cond)
         x_recon = self.vae.decoder(z)
 
         # L_recon
@@ -142,9 +142,10 @@ class AlignmentVAE(nn.Module):
     # ---- Inference ----
 
     @torch.no_grad()
-    def generate_from_label(self, labels: torch.Tensor) -> torch.Tensor:
+    def generate_from_label(self, cond) -> torch.Tensor:
+        """与 `forward` 同样接受 int labels 或 text dict。"""
         self.eval()
-        mu, logsigma = self.label_encoder(labels)
+        mu, logsigma = self.label_encoder(cond)
         sigma = torch.exp(torch.clamp(logsigma, min=-5, max=2))
         z = mu + sigma * torch.randn_like(mu)
         return self.vae.decoder(z)
@@ -162,9 +163,9 @@ class AlignmentVAE(nn.Module):
         return mu, torch.exp(logsigma)
 
     @torch.no_grad()
-    def encode_label_to_gaussian(self, labels: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode_label_to_gaussian(self, cond) -> Tuple[torch.Tensor, torch.Tensor]:
         self.eval()
-        mu, logsigma = self.label_encoder(labels)
+        mu, logsigma = self.label_encoder(cond)
         return mu, torch.exp(logsigma)
 
     @torch.no_grad()

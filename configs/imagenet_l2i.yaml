@@ -12,26 +12,20 @@ model:
   attn_resolutions: [16]                # Self-attention at 16x16 resolution
   double_z: true                        # Encoder outputs 2*D channels for (mu, logsigma)
 
-  # Spatial Label Encoder config
-  label_encoder_variant: "SLE-B"        # SLE-B | SLE-L | SLE-H
+  # ── 条件编码器 ───────────────────────────────────────────
+  # cond_type:
+  #   'label' (默认) → EmbeddingLabelEncoder
+  #                    （nn.Embedding 直接把 label 映射为 [h, w, latent_dim] 高斯）
+  #   'text'         → TextEncoderWrapper + SpatialTextEncoder (T2I, 见 coco_t2i.yaml)
+  cond_type: "label"
   num_classes: 1000                     # ImageNet classes
-  label_hidden_size: 768                # Transformer hidden dim
-  label_depth: 12                       # Number of AdaLN blocks
-  label_num_heads: 12                   # Attention heads
-  label_mlp_ratio: 4.0
-  label_in_context_len: 32              # In-context label tokens
-  label_in_context_start: 4             # Layer to inject in-context tokens
+
   # Initial log(σ) for label-side Gaussian heads.
   #   -2.0 → σ≈0.135
   #   -1.0 → σ≈0.368
   #   -0.5 → σ≈0.607
   #    0.0 → σ≈1.000   
   label_init_logsigma: -2.0
-
-  # 当置为 true 时，跳过 Transformer 标签编码器，直接通过 nn.Embedding
-  # 把 label 映射到 [h, w, latent_dim] 的高斯参数 (μ, logσ)。
-  # 该开关优先级高于 label_encoder_variant，用于消融实验或快速 baseline。
-  use_embedding_label_encoder: true
 
 training:
   # Per-GPU batch size. Effective batch = batch_size * accum_iter * num_gpus
@@ -61,7 +55,7 @@ training:
   grad_clip: 1.0
 
   # Performance optimization
-  use_amp: true                          # AMP mixed-precision training (fp16)
+  use_amp: true                          # AMP mixed-precision training
   use_compile: false                     # torch.compile (PyTorch 2.0+, set true to enable kernel fusion)
 
   # Logging and checkpointing
@@ -101,10 +95,10 @@ logging:
 # Launch command examples:
 #
 #   Single GPU:
-#     python train.py --config configs/default.yaml
+#     python train.py --config configs/imagenet_l2i.yaml
 #
 #   8 GPUs on one machine, with base LR scaling:
-#     torchrun --nproc_per_node=8 train.py --config configs/default.yaml 
+#     torchrun --nproc_per_node=8 train.py --config configs/imagenet_l2i.yaml
 #
 #   Resume from checkpoint:
-#     torchrun --nproc_per_node=8 train.py --config configs/default.yaml --resume ./output_dir
+#     torchrun --nproc_per_node=8 train.py --config configs/imagenet_l2i.yaml --resume ./output_dir
