@@ -22,12 +22,11 @@ model:
   label_in_context_len: 32              # In-context label tokens
   label_in_context_start: 4             # Layer to inject in-context tokens
   # Initial log(σ) for label-side Gaussian heads.
-  #   -2.0 → σ≈0.135   (太小，σ_img 会主动坍缩到这一常数水平，σ_label 失去学习信号)
+  #   -2.0 → σ≈0.135
   #   -1.0 → σ≈0.368
   #   -0.5 → σ≈0.607
-  #    0.0 → σ≈1.000   (与 VAE encoder 初始输出 σ≈1 对称，KL 初值最小、无方向偏置；
-  #                     符合标准正态先验直觉，需配合略低的 weight_alignment 防止重建受噪声干扰)
-  label_init_logsigma: 0.0
+  #    0.0 → σ≈1.000   
+  label_init_logsigma: -2.0
 
   # 当置为 true 时，跳过 Transformer 标签编码器，直接通过 nn.Embedding
   # 把 label 映射到 [h, w, latent_dim] 的高斯参数 (μ, logσ)。

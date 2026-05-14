@@ -249,12 +249,49 @@ def compute_fid_from_features(feats_real: np.ndarray, feats_gen: np.ndarray) -> 
 
 
 class MetricsComputer:
-    """Evaluation metrics: MSE, PSNR, SSIM, Inception features."""
+    """Evaluation metrics: MSE, PSNR, SSIM, Inception features.
 
-    def __init__(self, device: str = "cuda", compute_fid: bool = False):
+    PSNR is sensitive to data range. When inputs are normalized with ImageNet
+    mean/std (typical range ≈ [-2.12, 2.64]), the previous heuristic
+    `max_val = 1.0 if x.max() <= 1.0 else 255.0` incorrectly fell back to 255,
+    giving wildly inflated PSNR values (~57 dB instead of true ~9 dB).
+
+    To get a meaningful PSNR, this class accepts the normalization stats
+    (`mean`, `std`) used by the data pipeline and de-normalizes tensors back
+    to [0, 1] before computing PSNR (with MAX=1.0).
+    """
+
+    def __init__(
+        self,
+        device: str = "cuda",
+        compute_fid: bool = False,
+        mean: Optional[Tuple[float, ...]] = None,
+        std: Optional[Tuple[float, ...]] = None,
+    ):
         self.device = device
         self._ssim_kernel_cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
         self.inception = InceptionV3Features(device) if compute_fid else None
+
+        # Cache (mean, std) tensors for de-normalization. Shape [1, C, 1, 1] so
+        # they broadcast with [B, C, H, W] inputs without per-call allocation.
+        if mean is not None and std is not None:
+            self._denorm_mean = torch.tensor(mean, device=device).view(1, -1, 1, 1)
+            self._denorm_std = torch.tensor(std, device=device).view(1, -1, 1, 1)
+        else:
+            self._denorm_mean = None
+            self._denorm_std = None
+
+    def _denormalize_to_unit(self, x: torch.Tensor) -> torch.Tensor:
+        """De-normalize x using stored (mean, std) and clamp to [0, 1].
+
+        If no stats were provided, returns x unchanged so the caller can
+        fall back to its own heuristic. Channel count must match.
+        """
+        if self._denorm_mean is None or self._denorm_std is None:
+            return x
+        mean = self._denorm_mean.to(dtype=x.dtype, device=x.device)
+        std = self._denorm_std.to(dtype=x.dtype, device=x.device)
+        return (x * std + mean).clamp_(0.0, 1.0)
 
     def _get_ssim_kernel(self, channels: int, window_size: int,
                          device: torch.device) -> torch.Tensor:
@@ -275,6 +312,28 @@ class MetricsComputer:
         return torch.mean((x - x_recon) ** 2).item()
 
     def compute_psnr(self, x: torch.Tensor, x_recon: torch.Tensor) -> float:
+        """Peak Signal-to-Noise Ratio with consistent data range.
+
+        Both `x` and `x_recon` are first de-normalized to [0, 1] using the
+        cached (mean, std) so MSE and MAX live in the same numeric space.
+        Without this, ImageNet-normalized inputs (range ≈ [-2.12, 2.64])
+        would mis-trigger the old `max_val=255` branch, producing nonsense
+        PSNR values (e.g. ~57 dB) that don't reflect true reconstruction quality.
+
+        Falls back to the original heuristic only when no normalization stats
+        are configured (e.g., legacy callers passing already-unit-range tensors).
+        """
+        if self._denorm_mean is not None and self._denorm_std is not None:
+            x_unit = self._denormalize_to_unit(x)
+            x_recon_unit = self._denormalize_to_unit(x_recon)
+            mse = torch.mean((x_unit - x_recon_unit) ** 2)
+            if mse == 0:
+                return float('inf')
+            # MAX = 1.0 because both tensors are now clamped to [0, 1].
+            return (-10.0 * torch.log10(mse)).item()
+
+        # Legacy fallback: assume caller-provided tensors are already in
+        # either [0, 1] or [0, 255]. Kept for backward compatibility.
         mse = torch.mean((x - x_recon) ** 2)
         if mse == 0:
             return float('inf')
@@ -764,18 +823,23 @@ def main(args):
         log_writer = None
 
     # Dataset
+    # NOTE: Keep these stats in sync with `MetricsComputer(mean=..., std=...)`
+    # below so PSNR de-normalization uses the same constants as the data
+    # pipeline. Mismatching them would silently corrupt PSNR readings again.
+    imagenet_mean = (0.485, 0.456, 0.406)
+    imagenet_std = (0.229, 0.224, 0.225)
     transform_train = transforms.Compose([
         transforms.Resize(int(args.input_size * 1.1)),
         transforms.RandomCrop(args.input_size),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=list(imagenet_mean), std=list(imagenet_std)),
     ])
     transform_val = transforms.Compose([
         transforms.Resize(int(args.input_size * 1.1)),
         transforms.CenterCrop(args.input_size),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.Normalize(mean=list(imagenet_mean), std=list(imagenet_std)),
     ])
 
     train_dataset = ImageLabelDataset(
@@ -848,9 +912,13 @@ def main(args):
         print("Using AMP (automatic mixed precision) training")
 
     # Metrics
+    # Pass the same (mean, std) used by transform_{train,val} so PSNR can
+    # de-normalize tensors back to [0, 1] before computing 10·log10(1/MSE).
     metrics_computer = MetricsComputer(
         device=str(device),
         compute_fid=args.compute_fid,
+        mean=imagenet_mean,
+        std=imagenet_std,
     )
 
     # Resume
