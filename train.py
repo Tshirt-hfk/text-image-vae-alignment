@@ -815,9 +815,20 @@ def main(args):
 
     # Init tensorboard tracker (no-op on non-main rank)
     if args.use_tensorboard:
-        # `init_trackers` requires a JSON-serialisable config — strip yaml dict
-        safe_cfg = {k: v for k, v in vars(args).items()
-                    if isinstance(v, (str, int, float, bool, list, tuple))}
+        # tensorboard's add_hparams only accepts int/float/str/bool/Tensor —
+        # cast list/tuple/None to str so things like ch_mult=[1,2,4,4] don't crash.
+        def _hparam_value(v):
+            if isinstance(v, (int, float, bool, str)):
+                return v
+            if v is None or isinstance(v, (list, tuple)):
+                return str(v)
+            return None  # drop non-serialisable (e.g. dict like yaml_config)
+
+        safe_cfg = {}
+        for k, v in vars(args).items():
+            cast = _hparam_value(v)
+            if cast is not None:
+                safe_cfg[k] = cast
         accelerator.init_trackers(project_name="alignment_vae", config=safe_cfg)
 
     _print_config(args, accelerator)
