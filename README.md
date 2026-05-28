@@ -6,9 +6,9 @@
 - **图像重建**：图像 → VAE 潜变量 → 解码
 - **条件间插值生成**：在两个条件的高斯分布间线性插值后解码
 
-> 通过 `cond_type` 配置开关无缝切换两种模式：
-> - **Label 模式（默认）**：ImageNet 1000 类条件 → 图像
-> - **Text 模式（T2I）**：COCO Captions / CC3M 等图文对 → 文生图
+> 两套正交的开关，按需自由组合：
+> - **`cond_type`** ：`label`（默认，ImageNet 1000 类）/ `text`（COCO / CC3M 图文对，T2I）
+> - **`vae_variant`** ：`VAE-{B,L,H}`（Flux2-style CNN tokenizer，默认）/ `ViTVAE-{B,L,H}`（纯 Transformer tokenizer，ViT/JIT-style）
 
 ## 架构总览
 
@@ -31,17 +31,20 @@ Loss = w_recon · MSE(x, x̂)
 
 ### 核心组件
 
-- [`VAE`](model/vae.py:246-287)：Flux2 风格的 4 级 Conv2d 下采样 / 上采样（共 16× 压缩），ResBlock + 可选 [`AttnBlock`](model/vae.py:44-70)（PyTorch SDPA / FlashAttention），中间层 `Res-Attn-Res` 瓶颈。
-- [`EmbeddingLabelEncoder`](model/label_encoder.py)：**Label 模式**默认编码器。两张 `nn.Embedding` 表把 int label 映射到每个空间位置的 `(μ, logσ)`，参数量小、训练快。
-- [`SpatialTextEncoder`](model/text_encoder.py) + [`TextEncoderWrapper`](model/text_encoder.py)：**T2I 模式**。基于 [`AdaLNBlock`](model/text_encoder.py)（adaLN 调制 + 2D-RoPE + SwiGLU FFN + RMSNorm + QK-norm）的 Transformer 主干，配合 HuggingFace CLIP / T5 文本编码器。
-- [`AlignmentVAE`](model/alignment_vae.py)：组合模型，封装训练 forward 与多种推理接口。
+- [`VAE`](model/vae.py:264-306)：Flux2 风格的 4 级 Conv2d 下采样 / 上采样（共 16× 压缩），[`ResBlock`](model/vae.py:25-41) + 可选 [`AttnBlock`](model/vae.py:44-70)（PyTorch SDPA / FlashAttention），中间层 `Res-Attn-Res` 瓶颈。
+- [`ViTVAE`](model/vit_vae.py:321-385)：**纯 Transformer tokenizer**（ViT / JIT-style）。Encoder = [`PatchEmbed`](model/vit_vae.py:40-59) + 2D sin-cos PE + N×[`TransformerBlock`](model/vit_vae.py:78-97)（RoPE + SwiGLU + QK-norm + RMSNorm），Decoder 经 `latent_proj` → Transformer → `patch_head` → [`unpatchify`](model/vit_vae.py:62-71) 还原 RGB。`encoder/decoder/forward` 接口与 [`VAE`](model/vae.py:264-306) 完全一致，可作为 [`AlignmentVAE`](model/alignment_vae.py:13-194) 的 `vae=` 直接替换品。
+- [`EmbeddingLabelEncoder`](model/label_encoder.py:20-74)：**Label 模式**默认编码器。两张 `nn.Embedding` 表把 int label 映射到每个空间位置的 `(μ, logσ)`，参数量小、训练快。
+- [`SpatialTextEncoder`](model/text_encoder.py:216-400) + [`TextEncoderWrapper`](model/text_encoder.py:126-213)：**T2I 模式**。基于 [`AdaLNBlock`](model/text_encoder.py:81-99)（adaLN 调制 + 2D-RoPE + SwiGLU FFN + RMSNorm + QK-norm）的 Transformer 主干，配合 HuggingFace CLIP / T5 文本编码器。
+- [`AlignmentVAE`](model/alignment_vae.py:13-194)：组合模型，封装训练 forward 与多种推理接口。
 - [`GaussianAlignmentLoss`](loss/alignment_loss.py:15-78)：可单独使用的 KL 对齐损失模块（支持双向、温度缩放）。
 
 ### 预设变体
 
-VAE：[`VAE_models`](model/vae.py:309) — `VAE-B`（128ch）/ `VAE-L`（192ch）/ `VAE-H`（256ch，**默认**），均为 `ch_mult=[1,2,4,4]`，attn 在 16×16 分辨率，VAE-L/H 额外在 32×32 加 attn。
+CNN VAE：[`VAE_models`](model/vae.py:328) — `VAE-B`（128ch）/ `VAE-L`（192ch）/ `VAE-H`（256ch，**默认**），均为 `ch_mult=[1,2,4,4]`，attn 在 16×16 分辨率，VAE-L/H 额外在 32×32 加 attn。
 
-Spatial Text Encoder（仅 T2I）：[`SpatialTextEncoder_models`](model/text_encoder.py) — `STE-B`（depth=6, dim=768）/ `STE-L`（12, 1024）/ `STE-H`（16, 1280）。`TextEncoderWrapper` 把 caption 编为 `(seq_features, pooled, mask)`，`pooled` 走 AdaLN，`seq_features` 走 in-context tokens。
+ViT-VAE：[`ViTVAE_models`](model/vit_vae.py:422-426) — `ViTVAE-B`（hidden=768, depth=12, heads=12）/ `ViTVAE-L`（1024, 16, 16）/ `ViTVAE-H`（1280, 24, 16），patch_size=16。Encoder & Decoder 独立堆叠 Transformer，固定 2D sin-cos PE + per-head 2D-RoPE。
+
+Spatial Text Encoder（仅 T2I）：[`SpatialTextEncoder_models`](model/text_encoder.py:444-448) — `STE-B`（depth=6, dim=768）/ `STE-L`（12, 1024）/ `STE-H`（16, 1280）。[`TextEncoderWrapper`](model/text_encoder.py:126-213) 把 caption 编为 `(seq_features, pooled, mask)`，`pooled` 走 AdaLN，`seq_features` 走 in-context tokens。
 
 ## 损失函数
 
@@ -63,7 +66,7 @@ KL(N(μ₁,σ₁²) || N(μ₂,σ₂²)) = log(σ₂/σ₁) + (σ₁² + (μ₁-
 
 参考 [Unified Latents (Heek et al., 2026)](https://arxiv.org/abs/2602.17270) Sec 3.1 与 Ablation D：**可学习的 σ_img 容易塌缩或不稳定**，论文把 encoder 改成"确定性 μ + 固定噪声"，对齐到 prior 能解码到的最小 noise level（λ(0)=5，σ≈0.082）。
 
-本项目三份 yaml 已默认启用该模式：
+本项目所有 yaml 已默认启用该模式：
 
 ```yaml
 model:
@@ -72,9 +75,9 @@ model:
 ```
 
 启用后（默认）：
-- VAE encoder（CNN/ViT 均支持）的 `conv_out` / `logsigma_head` 只输出 μ，节省一半计算；
+- VAE encoder（CNN 与 ViT 均支持）的 `conv_out` / `logsigma_head` 只输出 μ，节省一半计算；
 - σ_img 在 forward 时由 `torch.full_like(mu, fixed_logsigma_img)` 即时生成，**不参与训练**；
-- KL 损失天然 well-defined：[`_kl_gaussian`](model/alignment_vae.py:135-140) 中 σ_img² 退化为常量，梯度只流向 μ_img 和 label encoder；
+- KL 损失天然 well-defined：[`_kl_gaussian`](model/alignment_vae.py:141-146) 中 σ_img² 退化为常量，梯度只流向 μ_img 和 label encoder；
 - 反向 KL 把 σ_label 也推向同一量级，模拟论文"对齐 encoder 噪声 & prior 噪声"的效果。
 
 如需回退到「VAE 学习 σ_img」的传统行为，把 `fixed_logsigma_img` 设为 `null` 即可（`double_z` 会重新生效）。
@@ -121,7 +124,15 @@ accelerate launch --multi_gpu --num_processes 8 \
 >
 > `--resume` 可指向 `output_dir`（自动选 `checkpoint-last/`）或具体 `checkpoint-{name}/`。
 
-T2I 训练相同，把 config 换成 [`configs/coco_t2i.yaml`](configs/coco_t2i.yaml) 并改其中的 `data_root`。
+切换 tokenizer / 任务只需换 config：
+
+| 任务 | 配置 | 说明 |
+|---|---|---|
+| **ImageNet L2I（CNN VAE，默认）** | [`configs/imagenet_l2i.yaml`](configs/imagenet_l2i.yaml) | `vae_variant: VAE-H` + `cond_type: label` |
+| **ImageNet L2I（ViT-VAE）** | [`configs/imagenet_l2i_vit.yaml`](configs/imagenet_l2i_vit.yaml) | `vae_variant: ViTVAE-B` + `cond_type: label`，纯 Transformer tokenizer |
+| **COCO T2I（CNN VAE + CLIP）** | [`configs/coco_t2i.yaml`](configs/coco_t2i.yaml) | `vae_variant: VAE-H` + `cond_type: text` + `text_encoder_name: clip`，需改 `data_root` |
+
+[`build_model`](train.py:399-502) 自动根据 `vae_variant` 在 [`VAE_models`](model/vae.py:328) 与 [`ViTVAE_models`](model/vit_vae.py:422-426) 之间分发；二者输出 latent 形状一致（`[B, H/16, W/16, latent_dim]`），与下游 [`AlignmentVAE`](model/alignment_vae.py:13-194) 完全解耦。
 
 ### 常用参数
 
@@ -151,10 +162,15 @@ T2I 训练相同，把 config 换成 [`configs/coco_t2i.yaml`](configs/coco_t2i.
 import torch
 from accelerate.utils import load_checkpoint_in_model
 from model import AlignmentVAE
-from model.vae import VAE_H
+from model.vae import VAE_H              # 或 from model.vit_vae import ViTVAE_B
 from model.label_encoder import EmbeddingLabelEncoder
 
+# CNN tokenizer（默认）
 vae = VAE_H(latent_dim=64, resolution=256)
+# 等价 ViT 替代品（与训练时 vae_variant 对齐即可）：
+# from model.vit_vae import ViTVAE_B
+# vae = ViTVAE_B(latent_dim=64, resolution=256)
+
 label_encoder = EmbeddingLabelEncoder(input_size=256, num_classes=1000, latent_dim=64)
 model = AlignmentVAE(input_size=256, latent_dim=64, num_classes=1000,
                      vae=vae, label_encoder=label_encoder).cuda().eval()
@@ -202,22 +218,23 @@ mu_c, sigma_c = model.encode_label_to_gaussian(cond_or_labels)
 
 ## 评估与 Checkpoint
 
-[`evaluate`](train.py:615-690) 在每个 epoch 后于验证集计算重建质量（MSE / PSNR / SSIM，见 [`MetricsComputer`](train.py:272-357)）和潜空间诊断（`mean_sigma_img/label`、双向 KL）。可选 FID（`compute_fid: true`）会基于 InceptionV3 pool3 (2048-d) 特征计算 **Recon FID**（原图 vs 重建）和 **Gen FID**（原图 vs 条件 → 图像）；多卡通过 `accelerator.gather` 跨 rank 聚合。所有指标写入 `output_dir/tensorboard/`。
+[`evaluate`](train.py:647-729) 在每个 epoch 后于验证集计算重建质量（MSE / PSNR / SSIM，见 [`MetricsComputer`](train.py:278-363)）和潜空间诊断（`mean_sigma_img/label`、双向 KL）。可选 FID（`compute_fid: true`）会基于 [`InceptionV3Features`](train.py:230-257) pool3 (2048-d) 特征计算 **Recon FID**（原图 vs 重建）和 **Gen FID**（原图 vs 条件 → 图像）；多卡通过 `accelerator.gather` 跨 rank 聚合。所有指标写入 `output_dir/tensorboard/`。
 
-[`main`](train.py:781-1007) 自动保存三类 checkpoint 目录到 `--output_dir`：
+[`main`](train.py:829-1071) 自动保存三类 checkpoint 目录到 `--output_dir`：
 
 - `checkpoint-last/` — 每 `save_freq` 个 epoch 与最后 epoch 覆写
 - `checkpoint-{epoch}/` — 每 50 个 epoch 归档
 - `checkpoint-best/` — 验证 loss 创新低时保存
 
-每个目录由 [`accelerator.save_state`](train.py:473-481) 写入：分片后的 model / optimizer / GradScaler / RNG，外加我们附带的 `meta.pt`（`epoch` + `args`）。续训用 `--resume`；推理用 `load_checkpoint_in_model`。
+每个目录由 [`accelerator.save_state`](train.py:535-544) 写入：分片后的 model / optimizer / GradScaler / RNG，外加我们附带的 `meta.pt`（`epoch` + `args`）。续训用 `--resume`；推理用 `load_checkpoint_in_model`。
 
 ## 文件结构
 
 ```
 .
 ├── model/
-│   ├── vae.py               # VAE Encoder/Decoder + VAE_B/L/H
+│   ├── vae.py               # CNN VAE Encoder/Decoder + VAE_{B,L,H}（Flux2-style）
+│   ├── vit_vae.py           # ViT-VAE Encoder/Decoder + ViTVAE_{B,L,H}（pure Transformer，drop-in 替代 vae.VAE）
 │   ├── label_encoder.py     # EmbeddingLabelEncoder（label 模式默认）
 │   ├── text_encoder.py      # SpatialTextEncoder + TextEncoderWrapper（T2I）
 │   └── alignment_vae.py     # AlignmentVAE 组合模型
@@ -225,10 +242,11 @@ mu_c, sigma_c = model.encode_label_to_gaussian(cond_or_labels)
 │   ├── label_image_dataset.py  # L2I 数据集（ImageFolder / dummy）
 │   └── text_image_dataset.py   # T2I 数据集（COCO / CSV / JSONL / dummy）
 ├── loss/alignment_loss.py    # GaussianAlignmentLoss
-├── util/                     # MetricLogger / lr_sched / RoPE 等工具
+├── util/                     # MetricLogger / lr_sched / RoPE / 2D sin-cos PE 等工具
 ├── configs/
-│   ├── imagenet_l2i.yaml     # ImageNet L2I 默认配置
-│   └── coco_t2i.yaml         # COCO T2I 配置
+│   ├── imagenet_l2i.yaml      # ImageNet L2I（CNN VAE，默认）
+│   ├── imagenet_l2i_vit.yaml  # ImageNet L2I（ViT-VAE）
+│   └── coco_t2i.yaml          # COCO T2I（CNN VAE + CLIP）
 ├── train.py                  # 训练入口（accelerate）
 ├── requirements.txt
 └── README.md
