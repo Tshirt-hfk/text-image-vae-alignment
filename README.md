@@ -59,6 +59,26 @@ KL(N(μ₁,σ₁²) || N(μ₂,σ₂²)) = log(σ₂/σ₁) + (σ₁² + (μ₁-
 | 前向对齐 KL | `KL(q_img \|\| q_label)` | 1.0 | 拉近图像分布到条件分布 |
 | 反向对齐 KL | `KL(q_label \|\| q_img)` | 0.1 | 稳定 μ 对齐，防止 σ 过冲 |
 
+### 固定 σ_img（论文 UL 风格，默认开启）
+
+参考 [Unified Latents (Heek et al., 2026)](https://arxiv.org/abs/2602.17270) Sec 3.1 与 Ablation D：**可学习的 σ_img 容易塌缩或不稳定**，论文把 encoder 改成"确定性 μ + 固定噪声"，对齐到 prior 能解码到的最小 noise level（λ(0)=5，σ≈0.082）。
+
+本项目三份 yaml 已默认启用该模式：
+
+```yaml
+model:
+  fixed_logsigma_img: -2.5     # σ_img = exp(-2.5) ≈ 0.082（默认）
+  # double_z 会被自动 force 为 false（encoder 输出通道砍半）
+```
+
+启用后（默认）：
+- VAE encoder（CNN/ViT 均支持）的 `conv_out` / `logsigma_head` 只输出 μ，节省一半计算；
+- σ_img 在 forward 时由 `torch.full_like(mu, fixed_logsigma_img)` 即时生成，**不参与训练**；
+- KL 损失天然 well-defined：[`_kl_gaussian`](model/alignment_vae.py:135-140) 中 σ_img² 退化为常量，梯度只流向 μ_img 和 label encoder；
+- 反向 KL 把 σ_label 也推向同一量级，模拟论文"对齐 encoder 噪声 & prior 噪声"的效果。
+
+如需回退到「VAE 学习 σ_img」的传统行为，把 `fixed_logsigma_img` 设为 `null` 即可（`double_z` 会重新生效）。
+
 ## 安装
 
 ```bash

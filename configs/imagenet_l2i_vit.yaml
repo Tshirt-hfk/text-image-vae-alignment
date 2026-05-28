@@ -1,0 +1,91 @@
+model:
+  name: "alignment_vae"
+  input_size: 256                       # Input image resolution
+  latent_dim: 64                        # Latent channel dim D (spatial: [B, H//16, W//16, D])
+  image_channels: 3
+
+  # ── ViT-VAE (pure-Transformer tokenizer, ViT/JIT-style) ─────────────
+  # encoder: PatchEmbed (16×16 conv) → N × Transformer (RoPE+SwiGLU)
+  #          → (μ, logσ) heads,  shape [B, 16, 16, latent_dim]
+  # decoder: latent_proj → N × Transformer → patch_head → unpatchify
+  # 与 model.vae.VAE 接口完全一致 —— AlignmentVAE / SpatialTextEncoder / EmbeddingLabelEncoder 无需改动。
+  vae_variant: "ViTVAE-B"               # ViTVAE-B | ViTVAE-L | ViTVAE-H
+  double_z: true                        # 仅当 fixed_logsigma_img=null 时生效；
+                                        # 启用固定 σ_img 后会被自动 force 为 false（去掉 logsigma_head）
+
+  # ── 固定 σ_img（论文 UL: Heek et al., 2026 — 默认启用）────────
+  # σ_img = exp(fixed_logsigma_img)。默认 -2.5（σ≈0.082，对齐论文 λ(0)=5）。
+  # 论文 Ablation D：可学习 σ_img 容易塌缩 / 不稳定，固定 σ 更稳更易调 bitrate。
+  # 设为 null 可回退到"ViT-VAE 学习 σ_img"的传统行为。
+  fixed_logsigma_img: -2.5
+
+  # NOTE: ViT-VAE 不使用下列 CNN 字段（保留仅为向后兼容；当 vae_variant 命中 ViTVAE-* 时会被忽略）
+  ch: 128
+  ch_mult: [1, 2, 4, 4]
+  num_res_blocks: 2
+  attn_resolutions: [16]
+
+  # ── 条件编码器 ───────────────────────────────────────────
+  cond_type: "label"
+  num_classes: 1000
+
+  # Initial log(σ) for label-side Gaussian heads.
+  label_init_logsigma: -2.0
+
+training:
+  batch_size: 128
+  accum_iter: 1
+  num_workers: 8
+  epochs: 100
+
+  lr: 1.0e-4
+  lr_label_encoder: 1.0e-4
+
+  lr_schedule: "constant"
+  warmup_epochs: 5
+  min_lr: 0.0
+
+  weight_recon: 1.0
+  weight_alignment: 1.0
+  weight_alignment_reverse: 0.1
+
+  alignment_temp: 1.0
+  grad_clip: 1.0
+
+  # bf16 推荐 — ViT-VAE 主要算力都是 SDPA / Linear，bf16 收益明显
+  amp_dtype: "bf16"
+  use_compile: false
+
+  log_interval: 100
+  save_interval: 10
+
+  dataset: "imagenet"
+  data_root: "/mnt/tidalfs-bdsz01/dataset/aigc-data/data/imagenet"
+  num_classes: 1000
+
+  compute_fid: true
+  fid_num_samples: 10000
+
+optimizer:
+  type: "adamw"
+  betas: [0.9, 0.999]
+  weight_decay: 0.01
+
+scheduler:
+  type: "cosine"
+  warmup_type: "linear"
+
+logging:
+  level: "INFO"
+  log_file: "./logs/training.log"
+  use_tensorboard: true
+  tensorboard_dir: "./logs/tensorboard"
+  use_wandb: false
+  wandb_project: "spatial-alignment-vae"
+
+# ============================================================================
+# Launch
+# ============================================================================
+#   accelerate launch --multi_gpu --num_processes 8 \
+#       train.py --config configs/imagenet_l2i_vit.yaml
+# ============================================================================

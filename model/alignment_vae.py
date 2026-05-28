@@ -26,6 +26,7 @@ class AlignmentVAE(nn.Module):
         num_res_blocks: int = 2,
         attn_resolutions: Optional[List[int]] = None,
         double_z: bool = True,
+        fixed_logsigma_img: Optional[float] = None,
         # Label encoder fallback params
         label_init_logsigma: float = -2.0,
         # Loss weights
@@ -55,7 +56,12 @@ class AlignmentVAE(nn.Module):
                 attn_resolutions=attn_resolutions or [16],
                 resolution=input_size,
                 double_z=double_z,
+                fixed_logsigma=fixed_logsigma_img,
             )
+
+        # 记录是否启用固定 σ_img（论文 UL 风格），方便日志/诊断
+        enc = getattr(self.vae, 'encoder', None)
+        self.fixed_logsigma_img = getattr(enc, 'fixed_logsigma', None)
 
         if label_encoder is not None:
             self.label_encoder = label_encoder

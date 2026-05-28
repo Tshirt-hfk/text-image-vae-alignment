@@ -10,7 +10,19 @@ model:
   ch_mult: [1, 2, 4, 4]                 # Channel multipliers → [128, 256, 512, 512]
   num_res_blocks: 2                     # ResBlocks per stage (encoder: 2, decoder: 3)
   attn_resolutions: [16]                # Self-attention at 16x16 resolution
-  double_z: true                        # Encoder outputs 2*D channels for (mu, logsigma)
+  double_z: true                        # 仅当 fixed_logsigma_img=null 时生效；
+                                        # 启用固定 σ_img 后会被自动 force 为 false（见下）
+
+  # ── 固定 σ_img（论文 UL: Heek et al., 2026 — 默认启用）────────
+  # 论文 Sec 3.1 + Ablation D 结论：可学习 σ_img 容易塌缩 / 不稳定，
+  #   "deterministic encoder + 固定噪声" 更稳定，且 latent bitrate 可解释。
+  # 数值含义：σ_img = exp(fixed_logsigma_img)
+  #   -2.5 → σ≈0.082  ← 默认（对齐论文 λ(0)=5）
+  #   -2.0 → σ≈0.135
+  #   -3.0 → σ≈0.050
+  # 启用时 conv_out 通道砍半（节省一半 encoder 输出端算力）。
+  # 设为 null 可回退到"VAE 学习 σ_img"的传统行为。
+  fixed_logsigma_img: -2.5
 
   # ── 条件编码器 ───────────────────────────────────────────
   # cond_type:
@@ -29,8 +41,8 @@ model:
 
 training:
   # Per-GPU batch size. Effective batch = batch_size * accum_iter * num_gpus
-  batch_size: 16
-  accum_iter: 4                         # Gradient accumulation steps (increase to simulate larger batch)
+  batch_size: 128
+  accum_iter: 1                         # Gradient accumulation steps (increase to simulate larger batch)
   num_workers: 8
   epochs: 100
 

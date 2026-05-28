@@ -1,4 +1,8 @@
 from .vae import VAE, VAEEncoder, VAEDecoder, VAE_B, VAE_L, VAE_H, VAE_models
+from .vit_vae import (
+    ViTVAE, ViTVAEEncoder, ViTVAEDecoder,
+    ViTVAE_B, ViTVAE_L, ViTVAE_H, ViTVAE_models,
+)
 from .label_encoder import EmbeddingLabelEncoder
 from .text_encoder import (
     SpatialTextEncoder, SpatialTextEncoder_models,

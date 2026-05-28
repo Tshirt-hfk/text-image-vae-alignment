@@ -59,6 +59,7 @@ from model.text_encoder import (
     SpatialTextEncoder, SpatialTextEncoder_models, TextEncoderWrapper,
 )
 from model.vae import VAE, VAE_models
+from model.vit_vae import ViTVAE, ViTVAE_models
 from dataset import ImageLabelDataset
 
 import util.misc as misc
@@ -146,6 +147,11 @@ def merge_config_and_args(cfg: Dict, args) -> argparse.Namespace:
     args.num_res_blocks = model_cfg.get('num_res_blocks', 2)
     args.attn_resolutions = model_cfg.get('attn_resolutions', [16])
     args.double_z = model_cfg.get('double_z', True)
+    # 固定 σ_img（论文 UL 风格）：None=保持现状；float=钉死 logσ_img 为该常量，
+    # 同时自动 force double_z=False。推荐 -2.5（σ≈0.082，对齐论文 λ(0)=5）。
+    args.fixed_logsigma_img = model_cfg.get('fixed_logsigma_img', None)
+    if args.fixed_logsigma_img is not None:
+        args.fixed_logsigma_img = float(args.fixed_logsigma_img)
     args.label_init_logsigma = model_cfg.get('label_init_logsigma', -2.0)
 
     # ── 条件编码器选择 ────────────────────────────────────────
@@ -391,19 +397,33 @@ def _fmt_params(n: int) -> str:
 
 
 def build_model(args) -> AlignmentVAE:
-    """Build AlignmentVAE from config args."""
+    """Build AlignmentVAE from config args.
+
+    `vae_variant` selects the tokenizer family:
+      - VAE-{B,L,H}    : CNN+Attn (Flux2-style) -> model.vae.VAE
+      - ViTVAE-{B,L,H} : pure-Transformer (ViT/JIT-style) -> model.vit_vae.ViTVAE
+      - 其它           : 走 yaml 中的细粒度配置（CNN VAE 的 ch/ch_mult/... 字段）
+    """
     vae_variant = getattr(args, 'vae_variant', 'VAE-B')
-    if vae_variant in VAE_models:
+    fixed_logsigma_img = getattr(args, 'fixed_logsigma_img', None)
+    if vae_variant in ViTVAE_models:
+        vae = ViTVAE_models[vae_variant](
+            latent_dim=args.latent_dim, resolution=args.input_size,
+            in_channels=args.image_channels, double_z=args.double_z,
+            fixed_logsigma=fixed_logsigma_img,
+        )
+    elif vae_variant in VAE_models:
         vae = VAE_models[vae_variant](
             latent_dim=args.latent_dim, resolution=args.input_size,
             in_channels=args.image_channels, double_z=args.double_z,
+            fixed_logsigma=fixed_logsigma_img,
         )
     else:
         vae = VAE(
             in_channels=args.image_channels, latent_dim=args.latent_dim,
             ch=args.ch, ch_mult=args.ch_mult, num_res_blocks=args.num_res_blocks,
             attn_resolutions=args.attn_resolutions, resolution=args.input_size,
-            double_z=args.double_z,
+            double_z=args.double_z, fixed_logsigma=fixed_logsigma_img,
         )
 
     cond_type = getattr(args, 'cond_type', 'label')
@@ -582,27 +602,39 @@ def train_one_epoch(
             accelerator.print(f"Loss is {loss_value}, stopping training", flush=True)
             sys.exit(1)
 
-        metric_logger.update(loss=loss_value)
-        metric_logger.update(loss_recon=metrics.get('loss_recon', 0))
-        metric_logger.update(loss_align=metrics.get('loss_alignment', 0))
-        metric_logger.update(loss_align_rev=metrics.get('loss_kl_reverse', 0))
-        metric_logger.update(sigma_img=metrics.get('mean_sigma_img', 0))
-        metric_logger.update(sigma_lbl=metrics.get('mean_sigma_label', 0))
+        # All-reduce key scalars across processes so both the rolling console
+        # log and TensorBoard reflect the true global (8-GPU) average rather
+        # than the main rank's local value.
+        def _reduce(v):
+            t = torch.tensor(float(v), device=accelerator.device)
+            return accelerator.reduce(t, reduction='mean').item()
+
+        loss_value_reduce       = _reduce(loss_value)
+        loss_recon_reduce       = _reduce(metrics.get('loss_recon', 0))
+        loss_align_reduce       = _reduce(metrics.get('loss_alignment', 0))
+        loss_align_rev_reduce   = _reduce(metrics.get('loss_kl_reverse', 0))
+        sigma_img_reduce        = _reduce(metrics.get('mean_sigma_img', 0))
+        sigma_lbl_reduce        = _reduce(metrics.get('mean_sigma_label', 0))
+
+        metric_logger.update(loss=loss_value_reduce)
+        metric_logger.update(loss_recon=loss_recon_reduce)
+        metric_logger.update(loss_align=loss_align_reduce)
+        metric_logger.update(loss_align_rev=loss_align_rev_reduce)
+        metric_logger.update(sigma_img=sigma_img_reduce)
+        metric_logger.update(sigma_lbl=sigma_lbl_reduce)
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)
 
-        # Per-step tensorboard log (loss reduced across processes for accuracy)
+        # Per-step tensorboard log (reuses the already-reduced scalars above)
         if step % args.log_freq == 0:
-            loss_t = torch.tensor(loss_value, device=accelerator.device)
-            loss_value_reduce = accelerator.reduce(loss_t, reduction='mean').item()
             epoch_1000x = int((step / len(data_loader) + epoch) * 1000)
             accelerator.log({
                 'train/loss':            loss_value_reduce,
-                'train/loss_recon':      metrics.get('loss_recon', 0),
-                'train/loss_alignment':  metrics.get('loss_alignment', 0),
-                'train/loss_kl_reverse': metrics.get('loss_kl_reverse', 0),
-                'train/mean_sigma_label': metrics.get('mean_sigma_label', 0),
-                'train/mean_sigma_img':  metrics.get('mean_sigma_img', 0),
+                'train/loss_recon':      loss_recon_reduce,
+                'train/loss_alignment':  loss_align_reduce,
+                'train/loss_kl_reverse': loss_align_rev_reduce,
+                'train/mean_sigma_label': sigma_lbl_reduce,
+                'train/mean_sigma_img':  sigma_img_reduce,
                 'train/lr':              lr,
             }, step=epoch_1000x)
 
@@ -639,16 +671,23 @@ def evaluate(
 
         x_recon = x_recon.float()
 
-        metric_logger.update(loss=loss.item())
-        metric_logger.update(loss_recon=metrics.get('loss_recon', 0))
-        metric_logger.update(loss_align=metrics.get('loss_alignment', 0))
-        metric_logger.update(loss_align_rev=metrics.get('loss_kl_reverse', 0))
-        metric_logger.update(sigma_img=metrics.get('mean_sigma_img', 0))
-        metric_logger.update(sigma_lbl=metrics.get('mean_sigma_label', 0))
+        # All-reduce per-step scalars across processes so the rolling Val log
+        # reflects the true global average across ranks (same as TensorBoard).
+        # Must be called on every rank to avoid deadlock.
+        def _reduce(v):
+            t = torch.tensor(float(v), device=accelerator.device)
+            return accelerator.reduce(t, reduction='mean').item()
 
-        metric_logger.update(mse=metrics_computer.compute_mse(images, x_recon))
-        metric_logger.update(psnr=metrics_computer.compute_psnr(images, x_recon))
-        metric_logger.update(ssim=metrics_computer.compute_ssim(images, x_recon))
+        metric_logger.update(loss=_reduce(loss.item()))
+        metric_logger.update(loss_recon=_reduce(metrics.get('loss_recon', 0)))
+        metric_logger.update(loss_align=_reduce(metrics.get('loss_alignment', 0)))
+        metric_logger.update(loss_align_rev=_reduce(metrics.get('loss_kl_reverse', 0)))
+        metric_logger.update(sigma_img=_reduce(metrics.get('mean_sigma_img', 0)))
+        metric_logger.update(sigma_lbl=_reduce(metrics.get('mean_sigma_label', 0)))
+
+        metric_logger.update(mse=_reduce(metrics_computer.compute_mse(images, x_recon)))
+        metric_logger.update(psnr=_reduce(metrics_computer.compute_psnr(images, x_recon)))
+        metric_logger.update(ssim=_reduce(metrics_computer.compute_ssim(images, x_recon)))
 
         if (metrics_computer.inception is not None
                 and fid_samples_collected < fid_num_samples):
@@ -719,6 +758,14 @@ def _print_config(args, accelerator: Accelerator):
     else:
         cond_encoder_str = "EmbeddingLabelEncoder"
 
+    fixed_logsigma_img = getattr(args, 'fixed_logsigma_img', None)
+    if fixed_logsigma_img is not None:
+        import math
+        sigma_str = f"{fixed_logsigma_img:.2f}  (σ_img≈{math.exp(fixed_logsigma_img):.3f}, "\
+                    f"deterministic encoder, double_z forced False)"
+    else:
+        sigma_str = "(learnable)"
+
     _section("Model", [
         ("vae_variant",           str(getattr(args, 'vae_variant', 'VAE-B'))),
         ("cond_type",             cond_type),
@@ -728,6 +775,7 @@ def _print_config(args, accelerator: Accelerator):
         ("image_channels",        str(args.image_channels)),
         ("num_classes",           str(args.num_classes)),
         ("double_z",              str(args.double_z)),
+        ("fixed_logsigma_img",    sigma_str),
     ])
 
     eff_bs = args.batch_size * args.accum_iter * accelerator.num_processes
@@ -798,6 +846,11 @@ def main(args):
         log_with="tensorboard" if args.use_tensorboard else None,
         project_config=project_config,
     )
+
+    # Silence `print` on non-main ranks so MetricLogger.log_every and other
+    # bare prints don't duplicate output across processes. `accelerator.print`
+    # is already main-only and unaffected by this.
+    misc.setup_for_distributed(accelerator.is_main_process)
 
     # Hardware sanity check for bf16
     if (mixed_precision == 'bf16'

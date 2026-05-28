@@ -100,20 +100,34 @@ class VAEEncoder(nn.Module):
     """
     [B, 3, H, W] → conv_in → {ResBlock × N, [Attn], Downsample} × 4
     → Mid(Res-Attn-Res) → norm → SiLU → conv_out → split → (μ, logσ) [B, h, w, D]
+
+    `fixed_logsigma`（默认 None）：
+        - None  → 与原行为一致：double_z=True 学习 (μ, logσ)；double_z=False 时 logσ≡0。
+        - float → 论文 UL (Heek et al., 2026) 风格的「deterministic encoder + 固定噪声」：
+                  encoder 只输出 μ（强制 double_z=False，conv_out 通道砍半），
+                  σ_img 被钉死为常数 exp(fixed_logsigma)。
+                  推荐值 -2.5（σ≈0.082，对齐论文 λ(0)=5）。
     """
 
     def __init__(self, in_channels: int = 3, latent_dim: int = 16, ch: int = 128,
                  ch_mult: Optional[List[int]] = None, num_res_blocks: int = 2,
                  attn_resolutions: Optional[List[int]] = None,
-                 resolution: int = 256, double_z: bool = True):
+                 resolution: int = 256, double_z: bool = True,
+                 fixed_logsigma: Optional[float] = None):
         super().__init__()
         ch_mult = ch_mult or [1, 2, 4, 4]
         attn_resolutions = attn_resolutions or [16]
+
+        # 固定 σ 模式：自动关闭 double_z，避免浪费 conv_out 一半的通道
+        if fixed_logsigma is not None:
+            double_z = False
 
         self.num_resolutions = len(ch_mult)
         self.num_res_blocks = num_res_blocks
         self.latent_dim = latent_dim
         self.double_z = double_z
+        self.fixed_logsigma = (float(fixed_logsigma)
+                               if fixed_logsigma is not None else None)
 
         self.conv_in = nn.Conv2d(in_channels, ch, 3, padding=1)
 
@@ -165,10 +179,14 @@ class VAEEncoder(nn.Module):
         if self.double_z:
             mu, logvar = torch.chunk(h, 2, dim=1)
             logsigma = 0.5 * logvar          # log(σ²) → log(σ)
+            logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
+        elif self.fixed_logsigma is not None:
+            # UL 风格：σ_img 钉死为常量，不参与训练（detach 不需要，因为没有可学习参数）
+            mu = h
+            logsigma = torch.full_like(mu, self.fixed_logsigma)
         else:
             mu, logsigma = h, torch.zeros_like(h)
 
-        logsigma = torch.clamp(logsigma, min=-5.0, max=2.0)
         mu = mu.permute(0, 2, 3, 1)
         logsigma = logsigma.permute(0, 2, 3, 1)
 
@@ -252,7 +270,8 @@ class VAE(nn.Module):
     def __init__(self, in_channels: int = 3, latent_dim: int = 16, ch: int = 128,
                  ch_mult: Optional[List[int]] = None, num_res_blocks: int = 2,
                  attn_resolutions: Optional[List[int]] = None,
-                 resolution: int = 256, double_z: bool = True):
+                 resolution: int = 256, double_z: bool = True,
+                 fixed_logsigma: Optional[float] = None):
         super().__init__()
         ch_mult = ch_mult or [1, 2, 4, 4]
         attn_resolutions = attn_resolutions or [16]
@@ -262,7 +281,7 @@ class VAE(nn.Module):
             in_channels=in_channels, latent_dim=latent_dim, ch=ch,
             ch_mult=ch_mult, num_res_blocks=num_res_blocks,
             attn_resolutions=attn_resolutions, resolution=resolution,
-            double_z=double_z,
+            double_z=double_z, fixed_logsigma=fixed_logsigma,
         )
         self.decoder = VAEDecoder(
             latent_dim=latent_dim, out_channels=in_channels, ch=ch,

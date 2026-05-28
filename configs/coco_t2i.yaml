@@ -28,7 +28,14 @@ model:
   ch_mult: [1, 2, 4, 4]
   num_res_blocks: 2
   attn_resolutions: [16]
-  double_z: true
+  double_z: true                        # 仅当 fixed_logsigma_img=null 时生效；
+                                        # 启用固定 σ_img 后会被自动 force 为 false
+
+  # ── 固定 σ_img（论文 UL: Heek et al., 2026 — 默认启用）────────
+  # σ_img = exp(fixed_logsigma_img)。默认 -2.5（σ≈0.082，对齐论文 λ(0)=5）。
+  # 论文 Ablation D：可学习 σ_img 容易塌缩 / 不稳定，固定 σ 更稳更易调 bitrate。
+  # 设为 null 可回退到"VAE 学习 σ_img"的传统行为。
+  fixed_logsigma_img: -2.5
 
   # ── T2I 关键开关 ────────────────────────────────────────
   # 'label' (默认；EmbeddingLabelEncoder) | 'text' (T2I)
@@ -58,8 +65,8 @@ training:
   dataset: "coco_captions"              # 仅作日志标识
 
   # ── 批/学习率 ──────────────────────────────────────────
-  batch_size: 16
-  accum_iter: 4
+  batch_size: 128
+  accum_iter: 1
   num_workers: 8
   epochs: 50
   lr: 1.0e-4
